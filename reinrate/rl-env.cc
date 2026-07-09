@@ -11,6 +11,8 @@
 #include "ns3/wifi-mac-header.h"
 #include <ctime>
 #include "ns3/config.h"
+#include "ns3/simulator.h"
+#include <cmath>
 #include <string>
 
 
@@ -44,14 +46,17 @@ RLRateEnv::GetTypeId (void)
 
 RLRateEnv::RLRateEnv (uint16_t id)
 {
-  m_ns3ai_mod = new Ns3AIRL<AiConstantRateEnv, AiConstantRateAct> (id);
-  m_ns3ai_mod->SetCond (2, 0);
+  auto interface = Ns3AiMsgInterface::Get ();
+  interface->SetIsMemoryCreator (false);
+  interface->SetUseVector (false);
+  interface->SetHandleFinish (true);
+  m_ns3ai_mod = interface->GetInterface<AiConstantRateEnv, AiConstantRateAct> ();
+  m_startTime = Simulator::Now ();
   NS_LOG_FUNCTION (this);
 }
 
 RLRateEnv::~RLRateEnv ()
 {
-  delete m_ns3ai_mod;
   NS_LOG_FUNCTION (this);
 }
 
@@ -67,6 +72,56 @@ void
 RLRateEnv::DoInitialize()
 {
     BuildSnrThresholds();
+}
+
+void
+RLRateEnv::BuildSnrThresholds()
+{
+  m_thresholds.clear();
+  WifiTxVector txVector;
+  uint8_t nss = 1;
+  for (const auto& mode : GetPhy()->GetModeList())
+    {
+      txVector.SetChannelWidth(20);
+      txVector.SetNss(nss);
+      txVector.SetMode(mode);
+      AddSnrThreshold(txVector, GetPhy()->CalculateSnr(txVector, m_ber));
+    }
+  if (GetHtSupported())
+    {
+      for (const auto& mode : GetPhy()->GetMcsList())
+        {
+          for (uint16_t width = 20; width <= GetPhy()->GetChannelWidth(); width *= 2)
+            {
+              txVector.SetChannelWidth(width);
+              uint16_t guardInterval = GetShortGuardIntervalSupported() ? 400 : 800;
+              txVector.SetGuardInterval(guardInterval);
+              nss = (mode.GetMcsValue() / 8) + 1;
+              txVector.SetNss(nss);
+              txVector.SetMode(mode);
+              AddSnrThreshold(txVector, GetPhy()->CalculateSnr(txVector, m_ber));
+            }
+        }
+    }
+}
+
+double
+RLRateEnv::GetSnrThreshold(WifiTxVector txVector) const
+{
+  auto it = std::find_if(m_thresholds.begin(), m_thresholds.end(),
+      [&txVector](const std::pair<double, WifiTxVector>& p) {
+        return txVector.GetMode() == p.second.GetMode()
+            && txVector.GetNss() == p.second.GetNss()
+            && txVector.GetChannelWidth() == p.second.GetChannelWidth();
+      });
+  NS_ASSERT_MSG(it != m_thresholds.end(), "SNR threshold not found");
+  return it->first;
+}
+
+void
+RLRateEnv::AddSnrThreshold(WifiTxVector txVector, double snr)
+{
+  m_thresholds.push_back(std::make_pair(snr, txVector));
 }
 
 double 
@@ -88,51 +143,45 @@ RLRateEnv::CalculateFER(const std::unordered_set<int>& A, const std::unordered_s
 void 
 RLRateEnv::TraceTxOk (Ptr<const Packet> packet)
 {
-  if (m_wifiMacAddress == Mac48Address("00:00:00:00:00:04"))
-  { 
-    packetsSentPerStep.insert(packet->GetUid());
-    m_txPerStep++;
-    m_txTotal_ap++;
-    m_txPerMetreRead_sta1++;
-    if (m_txPerStep == 1)
-    {
-      Time cur_time = Simulator::Now();
-      m_throughput_sta1 = (m_rxPerMetreRead_sta1 *1420 * 8.0) / (1024*1024)/(cur_time.GetSeconds() - m_startTime.GetSeconds());
-      m_rxPerMetreRead_sta1 = 0;
-      m_txPerMetreRead_sta1 = 0;
-      m_startTime = Simulator::Now ();
-      m_txPerStep = 0;
-      m_rxPerStep = 0;
-      m_txPhyPerStep = 0;
-      packetsSentPerStep.clear();
-      packetsReceivedPerStep.clear();
-      m_readyToUpdate = true;
-    }
-  } 
+  packetsSentPerStep.insert(packet->GetUid());
+  m_txPerStep++;
+  m_txTotal_ap++;
+  m_txPerMetreRead_sta1++;
+  if (m_txPerStep == 1)
+  {
+    Time cur_time = Simulator::Now();
+    double elapsed = cur_time.GetSeconds() - m_startTime.GetSeconds();
+    m_throughput_sta1 = elapsed > 0
+      ? (m_txPerMetreRead_sta1 *1420 * 8.0) / (1024*1024) / elapsed
+      : 0.0;
+    m_rxPerMetreRead_sta1 = 0;
+    m_txPerMetreRead_sta1 = 0;
+    m_startTime = Simulator::Now ();
+    m_txPerStep = 0;
+    m_rxPerStep = 0;
+    m_txPhyPerStep = 0;
+    packetsSentPerStep.clear();
+    packetsReceivedPerStep.clear();
+    m_readyToUpdate = true;
+  }
 }
 
 void
 RLRateEnv::TrackRxOk (Ptr<const Packet> packet)
 {
-  if (m_wifiMacAddress == Mac48Address("00:00:00:00:00:04"))
-  {
-    packetsReceivedPerStep.insert(packet->GetUid());
-    m_rxTotal_ap++;
-    m_rxPerMetreRead_sta1++;
-    m_rxPerStep++;
-  } 
+  packetsReceivedPerStep.insert(packet->GetUid());
+  m_rxTotal_ap++;
+  m_rxPerMetreRead_sta1++;
+  m_rxPerStep++;
 }
 
 void
 RLRateEnv::TrackPhyTxOk (Ptr<const Packet> packet, double txPowerDbm)
 {
-  if (m_wifiMacAddress == Mac48Address("00:00:00:00:00:04"))
-  {
-    m_txPhyPerStep++;
-  } 
+  m_txPhyPerStep++;
 }
 void
-RLRateEnv::TrackCw (uint32_t cw, uint8_t slot)
+RLRateEnv::TrackCw (uint32_t cw, uint32_t slot)
 {
   if (cw != 15)
   {
@@ -149,36 +198,33 @@ void
 RLRateEnv::DoReportRxOk (WifiRemoteStation *station,
                                        double rxSnr, WifiMode txMode)
 {
-  if (GetMac()->GetAddress() == Mac48Address("00:00:00:00:00:04"))
+  m_snr = rxSnr;
+  if (!isCwTraced)
   {
-    m_snr = rxSnr;
-    if (!isCwTraced)
-    {
-      std::string txop = GetMac()->GetQosSupported()
-            ? "BE_Txop"
-            : "Txop";
-      Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::WifiMac/" + txop + "/CwTrace", MakeCallback (&RLRateEnv::TrackCw, this));
-      std::cout<<"create cw trace at mac"<<GetMac()->GetAddress()<<std::endl;
-      isCwTraced = true;
-    }
-    
-    if (!isMacTxTraced)
-    {
-      Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacTx", MakeCallback (&RLRateEnv::TraceTxOk, this));
-      std::cout<<"create phytx trace at mac"<<GetMac()->GetAddress()<<std::endl;
-      isMacTxTraced = true;
-    }
-    if (!isMacRxTraced)
-    {
-      Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacRx", MakeCallback (&RLRateEnv::TrackRxOk, this));
-      std::cout<<"create macrx trace at mac"<<GetMac()->GetAddress()<<std::endl;
-      isMacRxTraced = true;
-    }
-    if (!isPhyTxTraced)
-    {
-      Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/PhyTxBegin", MakeCallback (&RLRateEnv::TrackPhyTxOk, this));
-      isPhyTxTraced = true;
-    }
+    std::string txop = GetMac()->GetQosSupported()
+          ? "BE_Txop"
+          : "Txop";
+    Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::WifiMac/" + txop + "/CwTrace", MakeCallback (&RLRateEnv::TrackCw, this));
+    std::cout<<"create cw trace at mac"<<GetMac()->GetAddress()<<std::endl;
+    isCwTraced = true;
+  }
+  
+  if (!isMacTxTraced)
+  {
+    Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacTx", MakeCallback (&RLRateEnv::TraceTxOk, this));
+    std::cout<<"create phytx trace at mac"<<GetMac()->GetAddress()<<std::endl;
+    isMacTxTraced = true;
+  }
+  if (!isMacRxTraced)
+  {
+    Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacRx", MakeCallback (&RLRateEnv::TrackRxOk, this));
+    std::cout<<"create macrx trace at mac"<<GetMac()->GetAddress()<<std::endl;
+    isMacRxTraced = true;
+  }
+  if (!isPhyTxTraced)
+  {
+    Config::ConnectWithoutContext ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/PhyTxBegin", MakeCallback (&RLRateEnv::TrackPhyTxOk, this));
+    isPhyTxTraced = true;
   }
   
   NS_LOG_FUNCTION (this << station << rxSnr << txMode);
@@ -207,11 +253,7 @@ RLRateEnv::DoReportAmpduTxStatus(WifiRemoteStation* st,
                                         uint16_t dataChannelWidth,
                                         uint8_t dataNss)
 {
-  if (GetMac()->GetAddress() == Mac48Address("00:00:00:00:00:04"))
-  {
-    m_snr = dataSnr;
-  }
-  
+  m_snr = dataSnr;
 }
 
 void
@@ -250,16 +292,13 @@ RLRateEnv::DoGetDataMode (WifiRemoteStation *st, uint32_t size)
 
 bool isMacSetup = false;
 WifiTxVector
-RLRateEnv::DoGetDataTxVector (WifiRemoteStation *st, uint16_t allowedWidth)
+RLRateEnv::DoGetDataTxVector (WifiRemoteStation *st)
 {
   NS_LOG_FUNCTION (this << st);
   m_wifiMacAddress = GetMac()->GetAddress ();
   
   if (m_readyToUpdate)
   {
-      if (m_wifiMacAddress == Mac48Address("00:00:00:00:00:04"))
-      {
-      }
     double maxThreshold = 0.0;
     WifiMode maxMode = GetDefaultModeForSta (st);
     WifiTxVector txVector;
@@ -277,18 +316,21 @@ RLRateEnv::DoGetDataTxVector (WifiRemoteStation *st, uint16_t allowedWidth)
           }
       }
 
-    auto env = m_ns3ai_mod->EnvSetterCond ();
+    m_ns3ai_mod->CppSendBegin ();
+    auto env = m_ns3ai_mod->GetCpp2PyStruct ();
     if (m_dataMode.GetModulationClass () == WIFI_MOD_CLASS_HT)
       env->mcs = m_dataMode.GetMcsValue ();
+    env->max_mcs = maxMode.GetMcsValue ();
     env->cw = m_cw;
-    env->throughput = m_throughput_sta1;
-    env->snr = m_snr;
-    m_ns3ai_mod->SetCompleted ();
+    env->throughput = std::isfinite(m_throughput_sta1) ? m_throughput_sta1 : 0.0;
+    env->snr = std::isfinite(m_snr) ? m_snr : 0.0;
+    m_ns3ai_mod->CppSendEnd ();
     
-    auto act = m_ns3ai_mod->ActionGetterCond ();
+    m_ns3ai_mod->CppRecvBegin ();
+    auto act = m_ns3ai_mod->GetPy2CppStruct ();
     m_next_mcs = act->next_mcs;
-    m_ns3ai_mod->GetCompleted ();
-    m_readyToUpdate = false;
+    m_ns3ai_mod->CppRecvEnd ();
+    m_readyToUpdate = true;
     if (m_next_mcs > 7)
     {
       m_next_mcs = 7;
@@ -309,9 +351,7 @@ RLRateEnv::DoGetDataTxVector (WifiRemoteStation *st, uint16_t allowedWidth)
       GetNumberOfAntennas (),
       m_nss,
       0,
-      GetPhy()->GetTxBandwidth(
-          m_dataMode,
-          std::min(allowedWidth, GetChannelWidth(st))),
+      GetChannelWidth(st),
       GetAggregation (st));
 }
 
@@ -329,9 +369,7 @@ RLRateEnv::DoGetRtsTxVector (WifiRemoteStation *st)
       1,
       1,
       0,
-      GetPhy()->GetTxBandwidth(
-          m_dataMode,
-          GetChannelWidth(st)),
+      GetChannelWidth(st),
       GetAggregation (st));
 }
 

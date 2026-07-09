@@ -50,6 +50,17 @@ struct ThroughputStats
   uint32_t convergenceSamples{0};
 };
 
+struct ThroughputSampleState
+{
+  Ptr<PacketSink> sink;
+  std::ofstream* csv{nullptr};
+  uint64_t lastTotalRx{0};
+  double interval{1.0};
+  ThroughputStats stats;
+  Ptr<MobilityModel> apMobility;
+  Ptr<MobilityModel> staMobility;
+};
+
 struct FastMobilityState
 {
   Ptr<MobilityModel> apMobility;
@@ -63,40 +74,36 @@ struct FastMobilityState
 };
 
 void
-WriteThroughputSample (Ptr<PacketSink> sink,
-                       std::ofstream* csv,
-                       uint64_t* lastTotalRx,
-                       double interval,
-                       ThroughputStats* stats)
+WriteThroughputSample (ThroughputSampleState* state)
 {
-  const uint64_t currentRx = sink->GetTotalRx ();
+  const uint64_t currentRx = state->sink->GetTotalRx ();
   const double now = Simulator::Now ().GetSeconds ();
   const double throughputMbps =
-      static_cast<double> (currentRx - *lastTotalRx) * 8.0 / interval / 1000000.0;
-  *lastTotalRx = currentRx;
+      static_cast<double> (currentRx - state->lastTotalRx) * 8.0 / state->interval / 1000000.0;
+  state->lastTotalRx = currentRx;
   std::string phase = "warmup";
-  ++stats->allSamples;
-  stats->allSum += throughputMbps;
-  if (now > stats->activeStart)
+  ++state->stats.allSamples;
+  state->stats.allSum += throughputMbps;
+  if (now > state->stats.activeStart)
     {
       phase = "active";
-      ++stats->activeSamples;
-      stats->activeSum += throughputMbps;
+      ++state->stats.activeSamples;
+      state->stats.activeSum += throughputMbps;
     }
-  if (now >= stats->convergenceStart)
+  if (now >= state->stats.convergenceStart)
     {
       phase = "convergence";
-      ++stats->convergenceSamples;
-      stats->convergenceSum += throughputMbps;
+      ++state->stats.convergenceSamples;
+      state->stats.convergenceSum += throughputMbps;
     }
-  *csv << now << ',' << throughputMbps << ',' << phase << '\n';
-  Simulator::Schedule (Seconds (interval),
-                       &WriteThroughputSample,
-                       sink,
-                       csv,
-                       lastTotalRx,
-                       interval,
-                       stats);
+  double distanceMeters = 0.0;
+  if (state->apMobility && state->staMobility)
+    {
+      distanceMeters =
+          CalculateDistance (state->apMobility->GetPosition (), state->staMobility->GetPosition ());
+    }
+  *state->csv << now << ',' << distanceMeters << ',' << throughputMbps << ',' << phase << '\n';
+  Simulator::Schedule (Seconds (state->interval), &WriteThroughputSample, state);
 }
 
 double
@@ -176,6 +183,9 @@ main (int argc, char* argv[])
   double mobilityPeriod = 2.4;
   double mobilityInterval = 0.02;
   double decisionInterval = 0.001;
+  bool linearMobility = false;
+  double startDistance = 0.0;
+  double mobilitySpeed = 0.5;
 
   CommandLine cmd (__FILE__);
   cmd.AddValue ("algorithm", "Rate manager: mab, dqn, or minstrel", algorithm);
@@ -196,6 +206,9 @@ main (int argc, char* argv[])
   cmd.AddValue ("mobilityPeriod", "Seconds for one near-far-near mobility cycle", mobilityPeriod);
   cmd.AddValue ("mobilityInterval", "Seconds between fast mobility position updates", mobilityInterval);
   cmd.AddValue ("decisionInterval", "Seconds between Python/ns3-ai rate decisions", decisionInterval);
+  cmd.AddValue ("linearMobility", "Move the STA away from a fixed AP at constant speed", linearMobility);
+  cmd.AddValue ("startDistance", "Initial AP/STA distance for linear mobility", startDistance);
+  cmd.AddValue ("mobilitySpeed", "STA speed in meters/second for linear mobility", mobilitySpeed);
   cmd.AddValue ("Seed", "RNG seed", seed);
   cmd.AddValue ("Run", "RNG run", run);
   cmd.Parse (argc, argv);
@@ -278,16 +291,34 @@ main (int argc, char* argv[])
   Config::Set ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_MaxAmpduSize",
                UintegerValue (0));
 
-  MobilityHelper mobility;
-  Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator> ();
-  positionAlloc->Add (Vector (0.0, 0.0, 0.0));
-  positionAlloc->Add (Vector (distance, 0.0, 0.0));
-  mobility.SetPositionAllocator (positionAlloc);
-  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
-  mobility.Install (wifiApNode);
-  mobility.Install (wifiStaNode);
+  MobilityHelper apMobilityHelper;
+  Ptr<ListPositionAllocator> apPositionAlloc = CreateObject<ListPositionAllocator> ();
+  apPositionAlloc->Add (Vector (0.0, 0.0, 0.0));
+  apMobilityHelper.SetPositionAllocator (apPositionAlloc);
+  apMobilityHelper.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  apMobilityHelper.Install (wifiApNode);
+
+  MobilityHelper staMobilityHelper;
+  Ptr<ListPositionAllocator> staPositionAlloc = CreateObject<ListPositionAllocator> ();
+  staPositionAlloc->Add (Vector (linearMobility ? startDistance : distance, 0.0, 0.0));
+  staMobilityHelper.SetPositionAllocator (staPositionAlloc);
+  if (linearMobility)
+    {
+      staMobilityHelper.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
+    }
+  else
+    {
+      staMobilityHelper.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+    }
+  staMobilityHelper.Install (wifiStaNode);
   Ptr<MobilityModel> apMobility = wifiApNode.Get (0)->GetObject<MobilityModel> ();
   Ptr<MobilityModel> staMobility = wifiStaNode.Get (0)->GetObject<MobilityModel> ();
+  if (linearMobility)
+    {
+      Ptr<ConstantVelocityMobilityModel> staVelocity =
+          DynamicCast<ConstantVelocityMobilityModel> (staMobility);
+      staVelocity->SetVelocity (Vector (mobilitySpeed, 0.0, 0.0));
+    }
   if (fastMobility)
     {
       minDistance = std::max (1.0, minDistance);
@@ -339,19 +370,17 @@ main (int argc, char* argv[])
       Simulator::Schedule (Seconds (0.0), &UpdateFastDistanceMotion, &mobilityState);
     }
   std::ofstream csv ("my-project-results/throughput-" + algorithm + ".csv");
-  csv << "time_s,throughput_mbps,phase\n";
-  uint64_t lastTotalRx = 0;
-  ThroughputStats stats;
-  stats.activeStart = 1.0;
-  stats.convergenceStart = convergenceStart;
+  csv << "time_s,distance_m,throughput_mbps,phase\n";
+  ThroughputSampleState throughputState;
+  throughputState.csv = &csv;
+  throughputState.interval = sampleInterval;
+  throughputState.stats.activeStart = 1.0;
+  throughputState.stats.convergenceStart = convergenceStart;
+  throughputState.apMobility = apMobility;
+  throughputState.staMobility = staMobility;
   Ptr<PacketSink> sink = DynamicCast<PacketSink> (sinkApp.Get (0));
-  Simulator::Schedule (Seconds (sampleInterval),
-                       &WriteThroughputSample,
-                       sink,
-                       &csv,
-                       &lastTotalRx,
-                       sampleInterval,
-                       &stats);
+  throughputState.sink = sink;
+  Simulator::Schedule (Seconds (sampleInterval), &WriteThroughputSample, &throughputState);
 
   Simulator::Stop (Seconds (simulationTime + 0.1));
   Simulator::Run ();
@@ -359,22 +388,27 @@ main (int argc, char* argv[])
   const double activeDuration = std::max (sampleInterval, simulationTime - 1.0);
   const double averageThroughputMbps =
       static_cast<double> (sink->GetTotalRx ()) * 8.0 / activeDuration / 1000000.0;
-  const double allSampleThroughputMbps = MeanOrZero (stats.allSum, stats.allSamples);
-  const double activeSampleThroughputMbps = MeanOrZero (stats.activeSum, stats.activeSamples);
+  const double allSampleThroughputMbps =
+      MeanOrZero (throughputState.stats.allSum, throughputState.stats.allSamples);
+  const double activeSampleThroughputMbps =
+      MeanOrZero (throughputState.stats.activeSum, throughputState.stats.activeSamples);
   const double convergenceThroughputMbps =
-      MeanOrZero (stats.convergenceSum, stats.convergenceSamples);
+      MeanOrZero (throughputState.stats.convergenceSum, throughputState.stats.convergenceSamples);
 
   std::ofstream summary ("my-project-results/summary-" + algorithm + ".csv");
   summary << "algorithm,seed,run,simulation_time_s,convergence_start_s,rx_bytes,"
              "average_active_mbps,sample_all_mbps,sample_active_mbps,"
              "sample_convergence_mbps,all_samples,active_samples,convergence_samples,"
-             "fast_mobility,min_distance_m,max_distance_m,mobility_period_s\n";
+             "fast_mobility,min_distance_m,max_distance_m,mobility_period_s,"
+             "linear_mobility,start_distance_m,mobility_speed_mps\n";
   summary << algorithm << ',' << seed << ',' << run << ',' << simulationTime << ','
           << convergenceStart << ',' << sink->GetTotalRx () << ',' << averageThroughputMbps
           << ',' << allSampleThroughputMbps << ',' << activeSampleThroughputMbps << ','
-          << convergenceThroughputMbps << ',' << stats.allSamples << ',' << stats.activeSamples
-          << ',' << stats.convergenceSamples << ',' << (fastMobility ? 1 : 0) << ','
-          << minDistance << ',' << maxDistance << ',' << mobilityPeriod << '\n';
+          << convergenceThroughputMbps << ',' << throughputState.stats.allSamples << ','
+          << throughputState.stats.activeSamples << ',' << throughputState.stats.convergenceSamples
+          << ',' << (fastMobility ? 1 : 0) << ','
+          << minDistance << ',' << maxDistance << ',' << mobilityPeriod << ','
+          << (linearMobility ? 1 : 0) << ',' << startDistance << ',' << mobilitySpeed << '\n';
   summary.close ();
 
   std::cout << "algorithm=" << algorithm << '\n'
@@ -382,7 +416,10 @@ main (int argc, char* argv[])
             << "channelWidth=" << channelWidth << " MHz\n"
             << "distance=" << distance << " m\n"
             << "fastMobility=" << (fastMobility ? "true" : "false") << '\n'
+            << "linearMobility=" << (linearMobility ? "true" : "false") << '\n'
             << "mobilityDistanceRange=" << minDistance << '-' << maxDistance << " m\n"
+            << "linearDistanceRange=" << startDistance << '-'
+            << (startDistance + mobilitySpeed * simulationTime) << " m\n"
             << "mobilityPeriod=" << mobilityPeriod << " s\n"
             << "convergenceStart=" << convergenceStart << " s\n"
             << "rxBytes=" << sink->GetTotalRx () << '\n'

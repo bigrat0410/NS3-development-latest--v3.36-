@@ -2,7 +2,7 @@
 #define AI_CONSTANT_RATE_WIFI_MANAGER_H
 
 #include "ns3/wifi-remote-station-manager.h"
-#include "ns3/ns3-ai-module.h"
+#include "ns3/ai-module.h"
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
@@ -16,13 +16,13 @@ struct AiConstantRateEnv
   uint16_t cw;
   double throughput;
   double snr;
-} Packed;
+} __attribute__((packed));
 
 struct AiConstantRateAct
 {
   uint8_t nss;
   uint8_t next_mcs;
-} Packed;
+} __attribute__((packed));
 
 /**
  * \ingroup wifi
@@ -62,14 +62,14 @@ private:
                        double dataSnr, uint16_t dataChannelWidth, uint8_t dataNss) override;
   void DoReportFinalRtsFailed (WifiRemoteStation *station) override;
   void DoReportFinalDataFailed (WifiRemoteStation *station) override;
-  WifiTxVector DoGetDataTxVector (WifiRemoteStation *station, uint16_t allowedWidth) override;
+  WifiTxVector DoGetDataTxVector (WifiRemoteStation *station) override;
   WifiTxVector DoGetRtsTxVector (WifiRemoteStation *station) override;
   WifiMode DoGetDataMode (WifiRemoteStation *station, uint32_t size);
   void CalculateThroughput (void);
   void EnqueueTimestamp (Ptr<const Packet> packet);
   void TrackRxOk (Ptr<const Packet> packet);
   void TraceTxOk (Ptr<const Packet> p);
-  void TrackCw (uint32_t cw, uint8_t slot);
+  void TrackCw (uint32_t cw, uint32_t slot);
   // void TrackTimeout (uint8_t reason, Ptr<const WifiPsdu> psdu, const WifiTxVector &txVector);
   void TrackPhyTxOk (Ptr<const Packet> packet, double txPowerDbm);
   void TrackMonitorSniffRx(Ptr<const Packet> packet, uint16_t channelFreqMhz, uint16_t channelNumber, uint32_t rate, bool isShortPreamble, double signalDbm, double noiseDbm);
@@ -99,7 +99,7 @@ private:
   uint32_t m_rxTotal_ap = 0;
   uint32_t m_txTotal_ap = 0;
   uint32_t m_txFail_ap = 0;
-  bool m_readyToUpdate = false;
+  bool m_readyToUpdate = true;
   uint8_t m_nss = 1;
   uint16_t m_cw = 15;
   uint8_t m_next_mcs = 0;
@@ -113,8 +113,7 @@ private:
   ns3::Mac48Address m_wifiMacAddress;
   WifiRemoteStation *m_station;
 
-  Ns3AIRL<AiConstantRateEnv, AiConstantRateAct> * m_ns3ai_mod;
-  uint16_t m_ns3ai_id;
+  Ns3AiMsgInterfaceImpl<AiConstantRateEnv, AiConstantRateAct> * m_ns3ai_mod;
 };
 
 } //namespace ns3

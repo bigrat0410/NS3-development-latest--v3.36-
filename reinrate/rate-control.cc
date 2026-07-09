@@ -321,13 +321,12 @@ main(int argc, char* argv[])
     RngSeedManager::SetSeed(seed); 
     std::cout<<"Random seed with"<<seed<<std::endl;
     RngSeedManager::SetRun(run); 
-    InitStream(run);
     NodeContainer wifiApNodes;
     wifiApNodes.Create(3);
 
     // Define the STAs
     NodeContainer wifiStaNodes;
-    wifiStaNodes.Create(3);
+    wifiStaNodes.Create(4);
 
     // Interference APs
     NodeContainer wifiInterferenceApNodes;
@@ -362,7 +361,6 @@ main(int argc, char* argv[])
     wifiPhy.Set("ChannelSettings",
                 StringValue("{0, " + std::to_string(chWidth) + ", " + frequencyBand + ", 0}"));
 
-    wifiPhy.Set("CcaSensitivity", DoubleValue(-9999));
     wifiPhy.Set("RxNoiseFigure", DoubleValue(0));
     wifiPhy.DisablePreambleDetectionModel();
 
@@ -387,21 +385,27 @@ main(int argc, char* argv[])
         WifiMacHelper wifiMac;
 
         wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                   "DataMode", StringValue("HtMcs1"), // Use MCS 1 for data
+                                   "DataMode", StringValue("HtMcs1"),
                                    "ControlMode", StringValue("HtMcs1"),
                                    "RtsCtsThreshold", UintegerValue(rtsThreshold));
 
+        Ssid targetSsid = Ssid("AP0");
+        wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(targetSsid));
+        wifiStaDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiStaNodes.Get(0)));
+
         Ssid ssid = Ssid("AP");
         wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(ssid));
-        wifiStaDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiStaNodes));
+        for (uint32_t i = 1; i < wifiStaNodes.GetN(); ++i)
+        {
+            wifiStaDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiStaNodes.Get(i)));
+        }
 
-        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                            "DataMode", StringValue("HtMcs7"), // Use MCS 1 for data
-                            "ControlMode", StringValue("HtMcs1"),
-                            "RtsCtsThreshold", UintegerValue(rtsThreshold));
+        wifi.SetRemoteStationManager(apManager,
+                                     "DataMode", StringValue("HtMcs7"),
+                                     "ControlMode", StringValue("HtMcs1"),
+                                     "RtsCtsThreshold", UintegerValue(rtsThreshold));
 
-        ssid = Ssid("AP");
-        wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+        wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(targetSsid));
         wifiApDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiApNodes.Get(0)));
         wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
                             "DataMode", StringValue("HtMcs7"), // Use MCS 1 for data
@@ -551,6 +555,14 @@ main(int argc, char* argv[])
     ApplicationContainer apps_sink_3 = sink_3.Install(wifiStaNodes.Get(2));
     PacketSinkHelper sink_4("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress_4, port4));
     ApplicationContainer apps_sink_4 = sink_4.Install(wifiStaNodes.Get(3));
+    apps_sink.Start(Seconds(0.0));
+    apps_sink_2.Start(Seconds(0.0));
+    apps_sink_3.Start(Seconds(0.0));
+    apps_sink_4.Start(Seconds(0.0));
+    apps_sink.Stop(Seconds(simuTime));
+    apps_sink_2.Stop(Seconds(simuTime));
+    apps_sink_3.Stop(Seconds(simuTime));
+    apps_sink_4.Stop(Seconds(simuTime));
 
     // Configure Onoff for AP 1
     OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress, port));
@@ -592,8 +604,8 @@ main(int argc, char* argv[])
     //--------------------------------------------
 
     // // Register packet receptions to calculate throughput
-    Config::Connect("/NodeList/1/ApplicationList/*/$ns3::PacketSink/Rx",
-                    MakeCallback(&NodeStatistics::RxCallback, &atpCounter));
+    Config::ConnectFailSafe("/NodeList/1/ApplicationList/*/$ns3::PacketSink/Rx",
+                            MakeCallback(&NodeStatistics::RxCallback, &atpCounter));
 
     // // Callbacks to print every change of rate
     Config::ConnectWithoutContextFailSafe(

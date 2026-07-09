@@ -1,5 +1,10 @@
+import argparse
+import sys
+import traceback
 from ctypes import *
-from py_interface import *
+from pathlib import Path
+import reinrate_py
+from ns3ai_utils import Experiment
 from model import DQNAgent, ReinforceAgent
 import numpy as np
 import time
@@ -10,6 +15,7 @@ class ReinrateEnv(Structure):
     _pack_ = 1
     _fields_ = [
         ('mcs', c_ubyte),
+        ('max_mcs', c_ubyte),
         ('cw', c_ushort),
         ('throughput', c_double),
         ('snr', c_double)
@@ -28,7 +34,6 @@ class ReinrateContainer:
     use_ns3ai = True
 
     def __init__(self, uid: int = 2335,model_name='',retrain=False) -> None:
-        self.rl = Ns3AIRL(uid, ReinrateEnv, ReinrateAct)
         self.agent = ReinforceAgent(1,8)
         self.isFinished = False
         self.startTime = time.time()
@@ -91,7 +96,9 @@ class ReinrateContainer:
         if self.isInference:
             return self.inference_reinforce(env, act)
 
-        scaled_snr = np.log(env.snr+1).astype(np.float32)
+        throughput = env.throughput if np.isfinite(env.throughput) else 0.0
+        snr = env.snr if np.isfinite(env.snr) and env.snr > -1 else 0.0
+        scaled_snr = np.log(snr+1).astype(np.float32)
         if self.isFirstEpisode == True :
             self.last_state['mcs'] = env.mcs
             rl_input = [scaled_snr]
@@ -101,17 +108,19 @@ class ReinrateContainer:
             self.isFirstEpisode = False
             return act
 
-        reward = self.calculate_reward(self.last_action['next_mcs'], self.last_state['mcs'])
+        reward = self.calculate_reward(throughput, self.last_state['mcs'], 20)
+        if not np.isfinite(reward):
+            reward = 0.0
         self.agent.rewards.append(reward)
         self.agent.update()
-        print(f'[Training] mcs: {self.last_state["mcs"]} -> {self.last_action["next_mcs"]}\t, cur_tpt: {env.throughput:.2f} Mbps, reward: {reward:.2f}, Snr: {scaled_snr:.2f}')
-        rl_input = [scaled_snr,env.throughput,env.cw,env.fer]
+        print(f'[Training] mcs: {self.last_state["mcs"]} -> {self.last_action["next_mcs"]}\t, cur_tpt: {throughput:.2f} Mbps, reward: {reward:.2f}, Snr: {scaled_snr:.2f}')
+        rl_input = [scaled_snr]
         next_mcs = self.agent.choose_action(rl_input)
         
         act.next_mcs = next_mcs
 
         self.last_state['mcs'] = env.mcs
-        self.last_state['throughput'] = env.throughput
+        self.last_state['throughput'] = throughput
         self.last_action['next_mcs'] = next_mcs
         return act
 
@@ -223,33 +232,55 @@ class ReinrateContainer:
 
 
 if __name__ == '__main__':
-    mempool_key = 1347 # memory pool key, arbitrary integer large than 1000
-    mem_size = 4096 # memory pool size in bytes
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sim-runs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=80)
+    parser.add_argument("--model", default="model.pt")
+    parser.add_argument("--retrain", action="store_true")
+    args = parser.parse_args()
 
-    memblock_key = 2335 # memory block key in the memory pool, arbitrary integer, and need to keep the same in the ns-3 script
+    script_dir = Path(__file__).resolve().parent
     iters_count = 0
 
-    sim_runs = 20
-    for i in range(sim_runs):
+    for i in range(args.sim_runs):
         rand_seed = np.random.randint(0, 100000)
-        ns3Settings = {"apManager":"ns3::rl-rateWifiManager","staManager":"ns3::rl-rateWifiManager","Run":i+1}
-        exp = Experiment(mempool_key, mem_size, 'rate-control', '../../', using_waf=False)
-        exp.reset()
-        c = ReinrateContainer(memblock_key,model_name='model.pt',retrain=False)
-        pro = exp.run(setting=ns3Settings, show_output=True)
+        ns3Settings = {
+            "apManager": "ns3::rl-rateWifiManager",
+            "staManager": "ns3::rl-rateWifiManager",
+            "Run": i + 1,
+            "Seed": rand_seed,
+            "steps": args.steps,
+        }
+        exp = Experiment("rate-control", str(script_dir / "../.."), reinrate_py, handleFinish=True)
+        c = ReinrateContainer(model_name=str(script_dir / args.model), retrain=args.retrain)
+        msgInterface = exp.run(setting=ns3Settings, show_output=True)
         print("run rate-control", ns3Settings)
-        epochs = 1000
-        with tqdm(total=epochs) as pbar:
-            while not c.rl.isFinish():
-                with c.rl as data:
-                    if data == None:
+        try:
+            with tqdm(total=args.epochs) as pbar:
+                while True:
+                    msgInterface.PyRecvBegin()
+                    if msgInterface.PyGetFinished():
                         break
-                    data.act = c.train_reinforce(data.env, data.act)
-                    pbar.update(1)
-                    if iters_count > epochs:
-                        c.save_model('model.pt')
-                        print('model saved')
-                        break
+                    env = msgInterface.GetCpp2PyStruct()
+                    msgInterface.PyRecvEnd()
+
+                    msgInterface.PySendBegin()
+                    act = msgInterface.GetPy2CppStruct()
+                    act.nss = 1
+                    if iters_count <= args.epochs:
+                        c.train_reinforce(env, act)
+                        pbar.update(1)
+                    else:
+                        act.next_mcs = c.last_action['next_mcs']
+                    msgInterface.PySendEnd()
+
                     iters_count += 1
-        pro.wait()
-    del exp
+                c.save_model(str(script_dir / args.model))
+                print('model saved')
+        except Exception as e:
+            print("Exception occurred: {}".format(e))
+            traceback.print_tb(sys.exc_info()[2])
+            raise
+        finally:
+            del exp
