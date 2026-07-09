@@ -54,15 +54,21 @@ main (int argc, char *argv[])
                                   "Exponent",
                                   DoubleValue (2.0));
 
-  //
+  //创建wifi-phy配置器,绑定无线信道
   YansWifiPhyHelper wifiPhy;
   wifiPhy.SetChannel (wifiChannel.Create ());
+
+  //设置误码率模型，nisterrorratemodel
   wifiPhy.SetErrorRateModel ("ns3::NistErrorRateModel");
+
+  //设置wifi工作信道，0表示自动选信道，如果写36就是选择5g-channel36，20Mhz带宽，5G频段，最后primary20Index = 0表示子信道位置
   wifiPhy.Set ("ChannelSettings", StringValue ("{0, 20, BAND_5GHZ, 0}"));
 
+  //创建wifihelper，确定标准
   WifiHelper wifi;
   wifi.SetStandard (WIFI_STANDARD_80211n);
 
+  //创建wifi-mac配置器，设置mac类型adhoc
   WifiMacHelper wifiMac;
   wifiMac.SetType ("ns3::AdhocWifiMac");
 
