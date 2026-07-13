@@ -9,6 +9,8 @@ target_link_libraries(
   libcore
   libmobility
   libnetwork
+  libinternet
+  libapplications
   libpropagation
   libwifi
   ${LIB_AS_NEEDED_POST}
