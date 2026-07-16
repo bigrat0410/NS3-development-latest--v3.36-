@@ -27,8 +27,12 @@ def main():
     parser.add_argument("csv_file", nargs="?", type=Path)
     parser.add_argument("--ideal-glob")
     parser.add_argument("--minstrel-glob")
+    parser.add_argument("--reinrate-csv", type=Path)
+    parser.add_argument("--reinrate-label", default="REINRATE Online")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--average-csv", type=Path)
+    parser.add_argument("--title", default="Scenario 1: 20-run Average")
+    parser.add_argument("--label", default="Throughput")
     args = parser.parse_args()
 
     if args.ideal_glob and args.minstrel_glob:
@@ -36,20 +40,25 @@ def main():
         mx, my, mc = average_files(args.minstrel_glob)
         series = [("Ideal", ix, iy, "#1565c0", "circle"),
                   ("Minstrel-HT", mx, my, "#d32f2f", "cross")]
+        if args.reinrate_csv:
+            rows = read_csv(args.reinrate_csv)
+            rx = [float(row["distance_m"]) for row in rows]
+            ry = [float(row["throughput_mbps"]) for row in rows]
+            series.append((args.reinrate_label, rx, ry, "#2e7d32", "square"))
         output = args.output or Path("my-project-results/reproduction-scenario1-average.svg")
         average_csv = args.average_csv or output.with_suffix(".csv")
         with average_csv.open("w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["algorithm", "distance_m", "throughput_mbps", "runs"])
             for label, xs, ys, _, _ in series:
-                runs = ic if label == "Ideal" else mc
+                runs = ic if label == "Ideal" else mc if label == "Minstrel-HT" else 1
                 for x, y in zip(xs, ys):
                     writer.writerow([label, f"{x:.6f}", f"{y:.6f}", runs])
     elif args.csv_file:
         rows = read_csv(args.csv_file)
         xs = [float(row["distance_m"]) for row in rows]
         ys = [float(row["throughput_mbps"]) for row in rows]
-        series = [("Throughput", xs, ys, "#1565c0", "circle")]
+        series = [(args.label, xs, ys, "#1565c0", "circle")]
         output = args.output or args.csv_file.with_suffix(".svg")
     else:
         parser.error("provide csv_file or both --ideal-glob and --minstrel-glob")
@@ -83,9 +92,11 @@ def main():
             px, py = sx(x), sy(y)
             if marker == "circle":
                 svg.append(f'<circle cx="{px:.2f}" cy="{py:.2f}" r="2.5" fill="{color}"/>')
+            elif marker == "square":
+                svg.append(f'<rect x="{px-2.5:.2f}" y="{py-2.5:.2f}" width="5" height="5" fill="{color}"/>')
             else:
                 svg.append(f'<path d="M {px-3:.2f} {py-3:.2f} L {px+3:.2f} {py+3:.2f} M {px-3:.2f} {py+3:.2f} L {px+3:.2f} {py-3:.2f}" stroke="{color}"/>')
-    svg.extend([f'<text x="{width/2}" y="20" text-anchor="middle" font-size="18" font-weight="bold">Scenario 1: 20-run Average</text>',
+    svg.extend([f'<text x="{width/2}" y="20" text-anchor="middle" font-size="18" font-weight="bold">{args.title}</text>',
                 f'<text x="{width/2}" y="{height-8}" text-anchor="middle" font-size="14">Distance (m)</text>',
                 f'<text x="18" y="{height/2}" text-anchor="middle" font-size="14" transform="rotate(-90 18 {height/2})">Throughput (Mbps)</text>'])
     for index, (label, _, _, color, _) in enumerate(series):

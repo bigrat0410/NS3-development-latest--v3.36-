@@ -74,7 +74,7 @@ using namespace ns3;
 
 namespace
 {
-
+//采样相关定义
 struct ThroughputSampler
 {
   Ptr<PacketSink> sink;
@@ -86,6 +86,7 @@ struct ThroughputSampler
   double stopTime{80.0};
 };
 
+//采样相关定义
 void
 SampleThroughput (ThroughputSampler* sampler)
 {
@@ -180,7 +181,6 @@ main (int argc, char *argv[])
                 << "pathLossExponent must be positive" << std::endl;
       return 1;
     }
-
   //创建两个节点：node 0 是 AP，node 1 是移动 STA
   NodeContainer wifiNodes;
   wifiNodes.Create (2);
@@ -320,6 +320,7 @@ main (int argc, char *argv[])
     }
   samples << "time_s,distance_m,throughput_mbps\n";
 
+  //采样器细节定义
   ThroughputSampler sampler;
   sampler.sink = DynamicCast<PacketSink> (sinkApps.Get (0));
   sampler.apMobility = wifiNodes.Get (0)->GetObject<MobilityModel> ();
@@ -344,6 +345,7 @@ main (int argc, char *argv[])
       std::cout << " (reference loss=" << referenceLoss << " dB, exponent="
                 << pathLossExponent << ")";
     }
+
   std::cout << std::endl;
   std::cout << "AP IPv4 address: " << apInterface.GetAddress (0) << std::endl;
   std::cout << "STA IPv4 address: " << staInterface.GetAddress (0) << std::endl;
