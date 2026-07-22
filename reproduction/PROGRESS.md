@@ -1593,3 +1593,146 @@ ns3ai_env/bin/python -B \
 - episode 500 的 19.00 dB `P(MCS4)=0.99984`，15.26 dB
   `P(MCS3)=0.99979`，冻结吞吐量 20.530511 Mbps。正式方案的意义是验证
   继续训练能否校准切换位置，而不是再次证明网络能够分区。
+
+## 20260722 - pi/q 与熵约束简明执行记录
+
+- 行为采样分布为 `q(a|s)=0.7*pi(a|s)+0.3/8`：70% 按策略采样，30% 在
+  八个 MCS 中均匀探索。目标策略仍是 `pi`，冻结验证关闭 epsilon 并使用
+  `argmax(pi)`。
+- 因为样本来自 `q` 而目标是 `pi`，每个样本使用
+  `rho=detach(pi(a|s)/q(a|s))`，策略项为
+  `-rho*log(pi(a|s))*reward`。这使
+  `E_q[rho*reward*grad(log pi)] = E_pi[reward*grad(log pi)]`，不把
+  epsilon 随机动作错误地当成策略主动选择；`rho` 必须 detach，不能参与
+  反向传播。
+- 熵约束只作用于策略分布，不是 reward baseline：
+  `H(pi)=-sum(pi*log(pi))`，训练损失加入 `-beta*H(pi)`。它防止某个
+  SNR 区间在局部排序尚未学完前把某个动作概率压到近零；epsilon 负责实际
+  探索，importance weight 负责采样校正，entropy 负责维持 `pi` 的可恢复性。
+  冻结验证仍然只取 `argmax(pi)`。
+- 若按 SNR 分箱均衡梯度，actor loss 和 entropy 都应先在每个非空 SNR bin
+  内求平均，再对 bin 等权平均，避免某区间的样本数量同时主导 reward 梯度
+  和熵保护。
+
+## 20260722 - 全场景 Raw-dB RBF + pi/q + Entropy 300 回合执行
+
+执行范围：
+
+- 直接修改 `scratch/reproduction/offline_reinforce_*` 通用 offline 系列，
+  使用完整 Scenario 1：80 s、1-41 m、0.5 m/s、60 Mbps、20 包决策窗口、
+  A-MPDU 关闭、MCS0-MCS7，训练 300 回合。
+- SNR 只做物理转换 `snr_db=10*log10(snr_linear)`，不做减均值、除标准差
+  或负值标准化。以全场景校准得到的原始 dB 范围生成 RBF 特征；RBF 特征
+  由原始 dB 计算并保持非负，不能把它误称为 SNR z-score。
+- 使用 RBF 局部状态特征减少不同距离之间的 reward 外溢；保留
+  `rho=detach(pi/q)`；加入 `-beta*entropy(pi)`；每 50 回合冻结监控并在
+  最终只生成一张包含所有冻结曲线的汇总 SVG。训练 history 必须记录
+  entropy、importance weight、SNR bin 计数、action counts、gradient norm
+  和冻结概率诊断。
+- 本轮执行前应先做无 reward 标签的全场景 SNR 校准，冻结 centers、sigma、
+  RBF 范围和分箱边界，并把这些值保存进 checkpoint；不能使用距离、Ideal
+  MCS 或人工切换点生成 RBF 中心。
+
+### 300 回合执行结果
+
+- 新增独立入口 `scratch/reproduction/offline_full_rbf_train.py`，未覆盖旧
+  offline checkpoint。使用 95 个 RBF 中心：原始 SNR dB 范围 5-52 dB、
+  间隔 0.5 dB、`sigma=0.6 dB`；状态总维度为 100，包括 95 维 RBF、
+  SNR-valid、CW、上一 MCS、上一吞吐量和窗口成功率。
+- 使用八个由既有完整场景 observation 无标签校准得到的原始 dB 分位区间；
+  每个区间先平均 `-detach(pi/q)*log(pi)*reward - 0.01*entropy`，再对非空
+  区间等权平均。300 回合均为完整 80 s 轨迹，每回合恰好一次更新。
+- 冻结监控结果：episode 50 为全程 MCS7，吞吐量 7.284780 Mbps；episode
+  100 开始出现 MCS7/MCS3 分区，11.227995 Mbps；episode 150 增加 MCS2
+  远端分区，15.467577 Mbps；episode 200/250/300 分别为
+  15.504961/15.507260/15.503668 Mbps，随后基本停滞。
+- episode 300 的冻结动作形成三个稳定连续区间：约 1.25-10.72 m 为 MCS7、
+  10.73-22.77 m 为 MCS3、22.78-41 m 为 MCS2。RBF 局部特征确实阻止了
+  单一动作覆盖全场景，但尚未形成 Ideal 所需的更细多 MCS 阶梯。
+- 冻结零吞吐比例从 episode 50 的 73.42% 降至 episode 150/200/300 的
+  约 18.35%，最长连续零吞吐采样从 116 降至 29；说明分区显著改善链路，
+  但 MCS2 在最远端仍产生持续 outage。
+- importance weight 均值在各里程碑约为 0.99-1.02，八个 SNR bin 每回合
+  均有样本，证明 `pi/q` 和分箱逻辑工作正常。主要失败点是 entropy 从
+  episode 50 的 1.9457 快速降至 episode 100/150/200/300 的
+  0.8444/0.3502/0.1788/0.1082；最低 importance weight 最终约
+  `6.7e-6`，`beta=0.01` 没有阻止局部动作概率过早接近零。
+- 完整性：history 为连续 300 行，`gradient_updates_total==episode`，最终
+  checkpoint 为 episode 300，episode 300 policy 与 final policy 张量
+  完全一致。最终只生成一张六曲线汇总 SVG：
+  `my-project-results/reproduction-scenario1-offline-full-rbf-piq-entropy-300-validation-every-50-episodes.svg`。
+- 结论：Raw-dB RBF 对“reward 外溢/全局动作塌缩”有效，`pi/q` 修正也保持
+  正常；本配置未达到完整场景收敛。下一轮应优先提高或自适应调整 entropy
+  约束，并检查 far-range stale SNR/动作持续时间，而不是继续扩大网络。
+
+## 2026-07-22 14:13 - 0.5 dB 局部 Advantage 奖励修正版（续训至 600 轮）
+
+### 修改和算法
+
+- 修正 `scratch/reproduction/rl-env.cc` 的 MCS 奖励权重：从 `mcs/7`
+  改为严格的 `(mcs+1)/8`。MCS0 成功窗口现在具有正奖励；80 s 预检中
+  240 个 MCS0 窗口全部为正，示例约 2.69-2.75。
+- 完整场景仍为 80 s、1-41 m、0.5 m/s、A-MPDU 关闭、每个动作保持到
+  20 个完成包；网络保持 `100 -> 256 -> 256 -> 256 -> 8`，参数量
+  159,496。状态包含 95 个 Raw-dB RBF 特征和 5 个尾部状态。
+- RBF 中心为 5-52 dB、间隔 0.5 dB、`sigma=0.6 dB`。上一轮虽然有
+  95 个 RBF 输入，却把梯度聚合压缩为 8 个宽分位区；本轮取消该压缩，
+  直接用最大响应 RBF 中心作为 advantage 区号，即 95 个 0.5 dB 有效区，
+  并为无效 SNR 单列第 96 区。历史轨迹每轮实际覆盖约 89-92 个有效区，
+  各区样本量足以计算局部统计。
+- 每个 80 s episode 内冻结策略、收集完整轨迹，结束后恰好执行一次
+  `optimizer.step()`。仍使用 `gamma=0`，所以 `return_t=reward_t`。
+- 每个非空 0.5 dB 区独立计算：
+  `adv=(reward-mean_bin)/(std_bin+1e-8)`；零方差或单样本区的 advantage
+  置零。每区 actor loss 与 entropy 先求均值，再对非空区等权平均。
+- 行为策略为 `q=(1-epsilon)*pi+epsilon/8`，`epsilon=0.3`；策略项为
+  `-detach(pi/q)*log(pi)*adv`。entropy 系数提高为 0.05，Adam 学习率
+  `1e-4`。这是一项改进实验，不是论文 19.52 原算法的严格复现。
+- 新增严格 `--resume`：校验 RBF、分区、reward、gamma、epsilon、entropy
+  和 history 连续性，并从第 301 轮加载 policy 与 Adam 状态续训。第 301
+  轮后 checkpoint 还保存 Python/Torch RNG 状态。
+
+### 里程碑结果
+
+```text
+episode  throughput(Mbps)  entropy   冻结策略动作
+50        7.284780         1.854127  MCS7
+100       7.920365         0.725322  MCS7/MCS2/MCS1（边界尚不稳定）
+150      16.380981         0.474664  MCS7/MCS2/MCS1
+200      17.186241         0.359002  MCS7/MCS3/MCS2/MCS1
+250      18.064269         0.280056  MCS7/MCS4/MCS3/MCS2/MCS1
+300      18.291754         0.206425  MCS7/MCS5/MCS4/MCS3/MCS2/MCS1
+350      18.449360         0.114717  同六档，MCS5 区继续扩大
+400      18.466324         0.078855  同六档，开始平台化
+450      18.469636         0.066358  同六档
+500      18.470931         0.061690  同六档
+550      18.478118         0.044126  同六档
+600      18.484014         0.045809  同六档
+```
+
+- 零吞吐比例从 episode 50 的 73.42% 降到 episode 100 的 5.06%，从
+  episode 150 到 600 均为 0。
+- episode 600 的主要连续距离分段为：
+  `1.25-10.32 m MCS7`、`10.32-12.49 m MCS5`、
+  `12.50-17.79 m MCS4`、`17.80-22.45 m MCS3`、
+  `22.48-30.34 m MCS2`、`30.35-41.00 m MCS1`。
+- `pi/q` 正常：各里程碑 importance mean 约 0.98-1.02。600 行 history
+  连续且每行 `updates=1`、`gradient_updates_total=episode`；checkpoint、
+  episode-600 policy 和 final policy 张量完全一致。
+
+### 结论
+
+- 95 个 0.5 dB 局部 advantage 区有效解决了旧 8 宽区的优化粒度问题：
+  策略由上一轮最终三个动作提高为六个稳定、连续、按 SNR 降档的动作区，
+  吞吐量由约 15.50 Mbps 提高到 18.48 Mbps，且消除了远端 outage。
+- 300 轮确实不够完全确认收敛，因为 250-300 轮仍新增 MCS5；但 400-600
+  轮吞吐量只增加约 0.018 Mbps、边界和动作计数基本不变，继续增加轮数
+  已不是产生 MCS6/MCS0 的有效手段。
+- 缺少 MCS0/MCS6 并非当前证据下的学习失败。episode 600 训练样本中，
+  30-41 m 的 MCS1/MCS0 平均 reward 分别约 4.23/2.73；1-12.5 m 的
+  MCS7/MCS6 平均 reward 分别约 22.15/18.07。当前 reward 本身分别偏好
+  MCS1 和 MCS7，因此贪心策略合理地跳过 MCS0 与 MCS6。
+- 输出前缀最初包含 `-300`，续训时为保持 checkpoint/config 一致没有改名；
+  其中 training CSV、checkpoint、final policy 和最终 SVG 的实际终点均为
+  episode 600。最终 SVG 含 episode 50-600 的 12 条冻结曲线：
+  `my-project-results/reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-rewardshift-300-validation-every-50-episodes.svg`。

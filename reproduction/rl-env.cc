@@ -240,7 +240,7 @@ RLRateEnv::PrepareWindowObservation ()
   // Preserve the source reward shape and 20-packet scale, but base it on
   // wall-clock goodput rather than DATA-only PHY airtime.
   m_rawReward = static_cast<double> (m_completedPackets) *
-                (static_cast<double> (mcs) / 7.0) *
+                ((static_cast<double> (mcs) + 1.0) / 8.0) *
                 efficiency * efficiency * efficiency;
   m_observationAggregateMpdus = static_cast<std::uint16_t> (m_completedPackets);
   m_observationSuccessfulMpdus = m_windowSuccessfulPackets;
