@@ -65,6 +65,8 @@
 #include "ns3/network-module.h"
 #include "ns3/wifi-module.h"
 
+#include "rl-env.h"
+
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -277,6 +279,13 @@ main (int argc, char *argv[])
 
   //取出 node 0 的第一个 Wi-Fi 网络设备，并转换为 WifiNetDevice，以便读取其内部的速率控制器
   Ptr<WifiNetDevice> wifiDevice = DynamicCast<WifiNetDevice> (apDevice.Get (0));
+
+  // Preserve the final incomplete 20-packet learning window at the episode boundary.
+  Ptr<RLRateEnv> rlManager = DynamicCast<RLRateEnv> (wifiDevice->GetRemoteStationManager ());
+  if (rlManager)
+    {
+      Simulator::Schedule (Seconds (simulationTime), &RLRateEnv::FlushPendingWindow, rlManager);
+    }
 
   //获取该 Wi-Fi 设备的 WifiRemoteStationManager，读取其实际类型名，例如 ns3::IdealWifiManager
   std::string rateManager = wifiDevice->GetRemoteStationManager ()->GetInstanceTypeId ().GetName ();

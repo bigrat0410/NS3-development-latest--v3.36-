@@ -15,7 +15,11 @@ PYBIND11_MODULE (reproduction_reinrate_py, module)
       .def_readwrite ("cw", &ns3::AiConstantRateEnv::cw)
       .def_readwrite ("throughput", &ns3::AiConstantRateEnv::throughput)
       .def_readwrite ("snr", &ns3::AiConstantRateEnv::snr)
-      .def_readwrite ("reward", &ns3::AiConstantRateEnv::reward);
+      .def_readwrite ("raw_reward", &ns3::AiConstantRateEnv::raw_reward)
+      .def_readwrite ("simulation_time", &ns3::AiConstantRateEnv::simulation_time)
+      .def_readwrite ("aggregate_mpdus", &ns3::AiConstantRateEnv::aggregate_mpdus)
+      .def_readwrite ("successful_mpdus", &ns3::AiConstantRateEnv::successful_mpdus)
+      .def_readwrite ("failed_mpdus", &ns3::AiConstantRateEnv::failed_mpdus);
 
   //Action：Python写回下一统计窗口要执行的动作
   py::class_<ns3::AiConstantRateAct> (module, "PyActStruct")
@@ -41,6 +45,7 @@ PYBIND11_MODULE (reproduction_reinrate_py, module)
       .def ("PySendBegin", &MsgInterface::PySendBegin)
       .def ("PySendEnd", &MsgInterface::PySendEnd)
       .def ("PyGetFinished", &MsgInterface::PyGetFinished)
+      .def ("PyReset", &MsgInterface::PyReset)
       .def ("GetCpp2PyStruct",
             &MsgInterface::GetCpp2PyStruct,
             py::return_value_policy::reference)

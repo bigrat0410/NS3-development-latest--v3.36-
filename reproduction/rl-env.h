@@ -22,7 +22,11 @@ struct AiConstantRateEnv
   std::uint16_t cw;//BE队列当前竞争窗口
   double throughput;//统计窗口内有效载荷吞吐量，单位Mbps
   double snr;//发送端收到ACK或Block ACK时的线性SNR
-  double reward;//当前动作覆盖的20个DATA包对应的折扣累计奖励
+  double raw_reward;//当前反馈的原始吞吐量；跨时间折扣只由Python计算
+  double simulation_time;//当前反馈产生的ns-3仿真时间，单位秒
+  std::uint16_t aggregate_mpdus;//本次PPDU/A-MPDU包含的MPDU总数
+  std::uint16_t successful_mpdus;//本次聚合中成功确认的MPDU数
+  std::uint16_t failed_mpdus;//本次聚合中失败的MPDU数
 } __attribute__ ((packed));
 
 // Python返回给C++的Action；当前复现只实际使用next_mcs
@@ -41,6 +45,9 @@ public:
   RLRateEnv ();
   ~RLRateEnv () override;
 
+  // Flush a final window containing fewer than DecisionPacketWindow packets.
+  void FlushPendingWindow ();
+
 private:
   using MsgInterface = Ns3AiMsgInterfaceImpl<AiConstantRateEnv, AiConstantRateAct>;
 
@@ -56,8 +63,10 @@ private:
   void RecordTransmissionAirtime (WifiRemoteStation* station, std::uint16_t count);
   void CompletePacket (bool success);
   void PrepareWindowObservation ();
+  void PrepareAmpduObservation (WifiRemoteStation* station,
+                                std::uint16_t nSuccessfulMpdus,
+                                std::uint16_t nFailedMpdus);
   void ResetWindow ();
-  double GetPacketReward (double packetThroughputMbps) const;
 
   // 与Python交换一次Observation/Action；EnableAi=false时不会进入共享内存
   void ExchangeWithAgent (WifiRemoteStation* station);
@@ -101,25 +110,32 @@ private:
   WifiMode m_ctlMode;//RTS使用的控制模式
   bool m_enableAi{false};//固定速率自检时关闭，运行Python代理时开启
   bool m_ampduEnabled{false};//从MAC的BE_MaxAmpduSize读取
+  bool m_decisionPerAmpdu{false};//每个完整PPDU/A-MPDU反馈后选择下一MCS
   Time m_measurementStart{Seconds (0.5)};//与场景业务开始时间保持一致
   Time m_decisionInterval{MilliSeconds (12)};//保留属性以兼容旧命令行；Paper20不使用定时决策
   std::uint32_t m_decisionPacketWindow{20};//一个动作固定覆盖的完成DATA包数
-  double m_rewardDiscount{0.99};
   std::uint32_t m_payloadSize{1420};//每个成功MPDU对应的有效UDP负载字节数
   double m_ber{1e-6};//估计max_mcs时使用的目标BER
 
   // Observation运行状态
   double m_snr{0.0};
   std::uint16_t m_cw{15};
-  double m_throughput{0.0};//当前20包窗口内按PHY airtime计算的有效负载吞吐量
-  double m_windowReward{0.0};
+  double m_throughput{0.0};//当前20包窗口内按仿真时间计算的有效负载goodput
+  double m_rawReward{0.0};
   std::uint64_t m_successfulPayloadBytes{0};
   Time m_transmissionAirtime{Seconds (0)};//当前20包窗口内DATA尝试占用的PHY时间
   Time m_currentPacketAirtime{Seconds (0)};
   std::uint32_t m_completedPackets{0};
+  std::uint16_t m_windowSuccessfulPackets{0};
+  std::uint16_t m_windowFailedPackets{0};
+  std::uint16_t m_observationAggregateMpdus{0};
+  std::uint16_t m_observationSuccessfulMpdus{0};
+  std::uint16_t m_observationFailedMpdus{0};
   bool m_windowHadAttempt{false};
   bool m_observationReady{false};
   bool m_initialActionSelected{false};
+  bool m_actionStartSet{false};
+  Time m_actionStart{Seconds (0)};//上一次动作生效的仿真时刻
   WifiRemoteStation* m_station{nullptr};
 
   // 只连接本速率管理器所属MAC的Txop，避免全局通配Trace污染

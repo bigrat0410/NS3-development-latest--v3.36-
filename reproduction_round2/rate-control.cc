@@ -1,0 +1,859 @@
+/*
+ * 【中文注释总览】
+ * 本文件是 ns-3 侧的仿真入口脚本，负责搭建 802.11n Wi-Fi 场景、节点移动、干扰 AP、UDP 业务流、
+ * FlowMonitor/PacketSink 吞吐统计以及仿真生命周期。真正的 DRL 速率自适应逻辑不在这里直接实现，
+ * 而是通过 WiFi RemoteStationManager 类型 ns3::rl-rateWifiManager 绑定到 rl-env.cc / rl-env.h。
+ *
+ * 关键关系：
+ * 1. 本文件选择 Rate Manager：staManager/apManager 默认均为 ns3::rl-rateWifiManager。
+ * 2. rl-rateWifiManager 在 MAC 发包决策时被 ns-3 调用，向 Python 发送 Observation 并读取 Action。
+ * 3. 本文件制造网络状态变化：STA 随机游走、干扰 AP 固定发包、链路损耗和接收情况共同影响 SNR/吞吐/丢包。
+ * 4. Python 端的 Reward 不在本文件计算，但吞吐、SNR、MCS 等统计源头来自本仿真环境。
+ */
+/*
+ * Copyright (c) 2014 Universidad de la República - Uruguay
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * Author: Matías Richart <mrichart@fing.edu.uy>
+ */
+
+/**
+ * This example program is designed to illustrate the behavior of
+ * rate-adaptive WiFi rate controls such as Minstrel.  Power-adaptive
+ * rate controls can be illustrated also, but separate examples exist for
+ * highlighting the power adaptation.
+ *
+ * This simulation consist of 2 nodes, one AP and one STA.
+ * The AP generates UDP traffic with a CBR of 54 Mbps to the STA.
+ * The AP can use any power and rate control mechanism and the STA uses
+ * only Minstrel rate control.
+ * The STA can be configured to move away from (or towards to) the AP.
+ * By default, the AP is at coordinate (0,0,0) and the STA starts at
+ * coordinate (5,0,0) (meters) and moves away on the x axis by 1 meter every
+ * second.
+ *
+ * The output consists of:
+ * - A plot of average throughput vs. distance.
+ * - (if logging is enabled) the changes of rate to standard output.
+ *
+ * Example usage:
+ * ./ns3 run "wifi-rate-adaptation-distance --standard=802.11a --staManager=ns3::MinstrelWifiManager
+ * --apManager=ns3::MinstrelWifiManager --outputFileName=minstrel"
+ *
+ * Another example (moving towards the AP):
+ * ./ns3 run "wifi-rate-adaptation-distance --standard=802.11a --staManager=ns3::MinstrelWifiManager
+ * --apManager=ns3::MinstrelWifiManager --outputFileName=minstrel --stepsSize=1 --STA1_x=-200"
+ *
+ * Example for HT rates with SGI and channel width of 40MHz:
+ * ./ns3 run "wifi-rate-adaptation-distance --staManager=ns3::MinstrelHtWifiManager
+ * --apManager=ns3::MinstrelHtWifiManager --outputFileName=minstrelHt --shortGuardInterval=true
+ * --channelWidth=40"
+ *
+ * To enable the log of rate changes:
+ * export NS_LOG=RateAdaptationDistance=level_info
+ */
+
+#include "ns3/boolean.h"
+#include "ns3/command-line.h"
+#include "ns3/config.h"
+#include "ns3/double.h"
+#include "ns3/gnuplot.h"
+#include "ns3/core-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/network-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/csma-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/internet-stack-helper.h"
+#include "ns3/ipv4-address-helper.h"
+#include "ns3/log.h"
+#include "ns3/mobility-helper.h"
+#include "ns3/mobility-model.h"
+#include "ns3/on-off-helper.h"
+#include "ns3/packet-sink-helper.h"
+#include "ns3/ssid.h"
+#include "ns3/string.h"
+#include "ns3/uinteger.h"
+#include "ns3/yans-wifi-channel.h"
+#include "ns3/yans-wifi-helper.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/ipv4-flow-classifier.h"
+#include "ns3/ideal-wifi-manager.h"
+#include "ns3/wifi-net-device.h"
+#include "ns3/propagation-loss-model.h"
+#include <fstream>
+#include <sys/stat.h> // for mkdir
+#include <string>
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("RateAdaptationDistance");
+
+std::ofstream g_csvFile;
+
+
+void
+EndSimulation()
+{
+  g_csvFile.close();
+}
+
+/** Node statistics */
+class NodeStatistics
+{
+  public:
+    /**
+     * Constructor
+     * \param aps AP devices
+     * \param stas STA devices
+     */
+    NodeStatistics(NetDeviceContainer aps, NetDeviceContainer stas);
+
+    /**
+     * RX callback
+     * \param path path
+     * \param packet received packet
+     * \param from sender
+     */
+    void RxCallback(std::string path, Ptr<const Packet> packet, const Address& from);
+    /**
+     * Set node position
+     * \param node the node
+     * \param position the position
+     */
+    void SetPosition(Ptr<Node> node, Vector position);
+    /**
+     * Advance node position
+     * \param node the node
+     * \param stepsSize the size of a step
+     * \param stepsTime the time interval between steps
+     */
+    void AdvancePosition(Ptr<Node> node, double stepsSize, int stepsTime);
+    /**
+     * Get node position
+     * \param node the node
+     * \return the position
+     */
+    void RandomMoveWithinRectangle(Ptr<Node> node);
+    Vector GetPosition(Ptr<Node> node);
+    /**
+     * \return the gnuplot 2d dataset
+     */
+    Gnuplot2dDataset GetDatafile();
+
+  private:
+    uint32_t m_bytesTotal;     //!< total bytes
+    Gnuplot2dDataset m_output; //!< gnuplot 2d dataset
+};
+
+NodeStatistics::NodeStatistics(NetDeviceContainer aps, NetDeviceContainer stas)
+{
+    m_bytesTotal = 0;
+}
+
+void
+// 【吞吐观测源】PacketSink/接收回调每收到一个包就累加字节数，后续可换算吞吐；这是状态 throughput 的底层来源之一。
+NodeStatistics::RxCallback(std::string path, Ptr<const Packet> packet, const Address& from)
+{
+    m_bytesTotal += packet->GetSize();
+}
+
+void
+NodeStatistics::SetPosition(Ptr<Node> node, Vector position)
+{
+    Ptr<MobilityModel> mobility = node->GetObject<MobilityModel>();
+    mobility->SetPosition(position);
+}
+
+Vector
+NodeStatistics::GetPosition(Ptr<Node> node)
+{
+    Ptr<MobilityModel> mobility = node->GetObject<MobilityModel>();
+    return mobility->GetPosition();
+}
+
+void
+NodeStatistics::AdvancePosition(Ptr<Node> node, double stepsSize, int stepsTime)
+{
+    Vector pos = GetPosition(node);
+    double mbs = ((m_bytesTotal * 8.0) / (1000000 * stepsTime));
+    m_bytesTotal = 0;
+    m_output.Add(pos.x, mbs);
+    pos.x += stepsSize;
+    SetPosition(node, pos);
+    Simulator::Schedule(Seconds(1*stepsTime),
+                        &NodeStatistics::AdvancePosition,
+                        this,
+                        node,
+                        stepsSize,
+                        stepsTime);
+}
+
+void
+NodeStatistics::RandomMoveWithinRectangle(Ptr<Node> node)
+{
+    double xMin = 10.0;
+    double xMax = 30.0;
+    double yMin = -20.0;
+    double yMax = 20.0;
+
+    Ptr<UniformRandomVariable> xRandom = CreateObject<UniformRandomVariable>();
+    xRandom->SetAttribute("Min", DoubleValue(xMin));
+    xRandom->SetAttribute("Max", DoubleValue(xMax));
+
+    Ptr<UniformRandomVariable> yRandom = CreateObject<UniformRandomVariable>();
+    yRandom->SetAttribute("Min", DoubleValue(yMin));
+    yRandom->SetAttribute("Max", DoubleValue(yMax));
+
+    double xPos = xRandom->GetValue();
+    double yPos = yRandom->GetValue();
+
+    SetPosition(node, Vector(xPos, yPos, 0.0));
+    std::cout<<"Position: "<<Vector(xPos, yPos, 0.0)<<std::endl;
+
+    Simulator::Schedule(Seconds(5), &NodeStatistics::RandomMoveWithinRectangle, this, node);
+}
+
+
+Gnuplot2dDataset
+NodeStatistics::GetDatafile()
+{
+    return m_output;
+}
+
+/**
+ * Callback for 'Rate' trace source
+ *
+ * \param oldRate old MCS rate (bits/sec)
+ * \param newRate new MCS rate (bits/sec)
+ */
+void
+RateCallback(uint64_t oldRate, uint64_t newRate)
+{
+    NS_LOG_INFO("Rate " << newRate / 1000000.0 << " Mbps");
+}
+struct DataForThpt
+{
+// 【网络性能统计】FlowMonitor 用于收集端到端吞吐、时延、收包数等指标，辅助评估 DRL 速率控制效果。
+  FlowMonitorHelper flowmon;
+  Ptr<FlowMonitor> monitor;
+  uint32_t totalRxPackets; //Total number of received packets in all flows
+  uint64_t totalRxBytes; // Total bytes received in all flows
+  double totalDelaySum; // Total delay sum in all flows
+  double
+  averageDelay ()
+  {
+    return totalRxPackets ? totalDelaySum / totalRxPackets / 100000000 : 0;
+  }
+} data; 
+
+double duration = 1.0; // Duration of simulation (s)
+double statInterval = 0.5; // Time interval of calling function Throughput
+
+void 
+// 【吞吐统计】周期性读取 PacketSink 的累计接收字节，计算 Mbps；用于观察速率自适应效果。
+CalculateThroughput(Ptr<PacketSink> sink1, Ptr<PacketSink> sink2, double lastTotalRx[2], double interval)
+{
+    double currentRx1 = sink1->GetTotalRx();
+    double currentRx2 = sink2->GetTotalRx();
+
+    double throughput1 = (currentRx1 - lastTotalRx[0]) * 8.0 / interval / (1024 * 1024);
+    double throughput2 = (currentRx2 - lastTotalRx[1]) * 8.0 / interval / (1024 * 1024);
+
+    lastTotalRx[0] = currentRx1;
+    lastTotalRx[1] = currentRx2;
+
+    double timeNow = Simulator::Now().GetSeconds();
+    g_csvFile << timeNow << " " << throughput1 << std::endl;
+    Simulator::Schedule(Seconds(interval), &CalculateThroughput, sink1, sink2, lastTotalRx, interval);
+}
+
+int
+LegacyMain(int argc, char* argv[])
+{
+    uint32_t rtsThreshold = 65535;
+// 【速率控制器入口】STA/AP 默认使用 ns3::rl-rateWifiManager，将 802.11 速率选择委托给 rl-env.cc 中的 DRL 控制器。
+    std::string staManager = "ns3::rl-rateWifiManager";
+    std::string apManager = "ns3::rl-rateWifiManager";
+    std::string interferenceManager = "ns3::MinstrelHtWifiManager";
+    std::string standard = "802.11n-5GHz";
+    std::string outputFileName = "rl-rate-interference";
+    uint32_t BeMaxAmpduSize = 65535;//Disable the A-MPDU
+    bool shortGuardInterval = false;
+    uint32_t chWidth = 20;
+    int ap_num = 1;
+    int ap1_x = 0;
+    int ap1_y = 0;
+    int sta1_x = 5;
+    int sta1_y = 0;
+    int steps = 80;
+    double stepsSize = 1;
+    int stepsTime = 1;
+    int run = 1;
+    int seed = 1;
+
+    CommandLine cmd(__FILE__);
+    cmd.AddValue("staManager", "Rate adaptation manager of the STA", staManager);
+    cmd.AddValue("apManager", "Rate adaptation manager of the AP", apManager);
+    cmd.AddValue("standard", "Wifi standard (a/b/g/n/ac only)", standard);
+    cmd.AddValue("shortGuardInterval",
+                 "Enable Short Guard Interval in all stations",
+                 shortGuardInterval);
+    cmd.AddValue("channelWidth", "Channel width of all the stations", chWidth);
+    cmd.AddValue("rtsThreshold", "RTS threshold", rtsThreshold);
+    cmd.AddValue("BeMaxAmpduSize", "BE Mac A-MPDU size", BeMaxAmpduSize);
+    cmd.AddValue("outputFileName", "Output filename", outputFileName);
+    cmd.AddValue("steps", "How many different distances to try", steps);
+    cmd.AddValue("stepsTime", "Time on each step", stepsTime);
+    cmd.AddValue("stepsSize", "Distance between steps", stepsSize);
+    cmd.AddValue("AP1_x", "Position of AP1 in x coordinate", ap1_x);
+    cmd.AddValue("AP1_y", "Position of AP1 in y coordinate", ap1_y);
+    cmd.AddValue("STA1_x", "Position of STA1 in x coordinate", sta1_x);
+    cmd.AddValue("STA1_y", "Position of STA1 in y coordinate", sta1_y);
+    cmd.AddValue("APNUM", "AP for interference", ap_num);
+    cmd.AddValue("Run", "Random Seed", run);
+    cmd.AddValue("Seed", "Random Seed", seed);
+    cmd.Parse(argc, argv);
+
+    int simuTime = steps * stepsTime;
+
+    if (standard != "802.11a" && standard != "802.11b" && standard != "802.11g" &&
+        standard == "802.11n-2.4GHz" && standard != "802.11n-5GHz" && standard != "802.11ac")
+    {
+        NS_FATAL_ERROR("Standard " << standard << " is not supported by this program");
+    }
+
+    RngSeedManager::SetSeed(seed); 
+    std::cout<<"Random seed with"<<seed<<std::endl;
+    RngSeedManager::SetRun(run); 
+    NodeContainer wifiApNodes;
+    wifiApNodes.Create(3);
+
+    // Define the STAs
+    NodeContainer wifiStaNodes;
+    wifiStaNodes.Create(3);
+
+    // Interference APs
+    NodeContainer wifiInterferenceApNodes;
+    wifiInterferenceApNodes.Create(4);
+
+    std::string errorModelType = "ns3::NistErrorRateModel"; // Error Model
+    YansWifiPhyHelper wifiPhy;
+    YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default();
+
+    // Set Propagation Loss Model
+    wifiChannel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
+    wifiChannel.AddPropagationLoss ("ns3::MatrixPropagationLossModel","DefaultLoss",DoubleValue(20.0));
+
+    // Set Transmission Power
+    wifiPhy.Set ("TxPowerStart", DoubleValue (20.0));
+    wifiPhy.Set ("TxPowerEnd", DoubleValue (20.0));
+
+    // Create a loss model and set default loss
+    wifiPhy.SetChannel(wifiChannel.Create());
+// 【丢包/误码模型】NistErrorRateModel 根据 SNR、调制编码方式等判断接收是否成功，间接影响丢包率和吞吐。
+    wifiPhy.SetErrorRateModel (errorModelType);
+
+    // Channel configuration via ChannelSettings attribute can be performed here
+    std::string frequencyBand;
+    if (standard == "802.11b" || standard == "802.11g" || standard == "802.11n-2.4GHz")
+    {
+        frequencyBand = "BAND_2_4GHZ";
+    }
+    else
+    {
+        frequencyBand = "BAND_5GHZ";
+    }
+    wifiPhy.Set("ChannelSettings",
+                StringValue("{0, " + std::to_string(chWidth) + ", " + frequencyBand + ", 0}"));
+
+    wifiPhy.Set("CcaSensitivity", DoubleValue(-9999));
+    wifiPhy.Set("RxNoiseFigure", DoubleValue(0));
+    wifiPhy.DisablePreambleDetectionModel();
+
+    NetDeviceContainer wifiApDevices;
+    NetDeviceContainer wifiStaDevices;
+    NetDeviceContainer wifiInterferenceDevices;
+    NetDeviceContainer wifiDevices;
+
+    WifiHelper wifi;
+
+    if (standard == "802.11n-2.4GHz" || standard == "802.11n-5GHz" || standard == "802.11ac")
+    {
+        if (standard == "802.11n-2.4GHz" || standard == "802.11n-5GHz")
+        {
+            wifi.SetStandard(WIFI_STANDARD_80211n);
+        }
+        else if (standard == "802.11ac")
+        {
+            wifi.SetStandard(WIFI_STANDARD_80211ac);
+        }
+
+        WifiMacHelper wifiMac;
+
+// 【802.11 速率管理挂载点】这里设置 ns-3 的 RemoteStationManager；若传入 rl-rateWifiManager，MAC 层会回调其 DoGetDataTxVector 选择 MCS。
+        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                   "DataMode", StringValue("HtMcs1"), // Use MCS 1 for data
+                                   "ControlMode", StringValue("HtMcs1"),
+                                   "RtsCtsThreshold", UintegerValue(rtsThreshold));
+
+        Ssid ssid = Ssid("AP");
+        wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(ssid));
+        wifiStaDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiStaNodes));
+
+        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                            "DataMode", StringValue("HtMcs7"), // Use MCS 1 for data
+                            "ControlMode", StringValue("HtMcs1"),
+                            "RtsCtsThreshold", UintegerValue(rtsThreshold));
+
+        ssid = Ssid("AP");
+        wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+        wifiApDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiApNodes.Get(0)));
+        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                            "DataMode", StringValue("HtMcs7"), // Use MCS 1 for data
+                            "ControlMode", StringValue("HtMcs1"),
+                            "RtsCtsThreshold", UintegerValue(rtsThreshold));
+
+        ssid = Ssid("AP");
+        wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+        wifiApDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiApNodes.Get(1)));
+        wifiApDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiApNodes.Get(2)));
+
+        
+        ssid = Ssid("InterferenceAP");
+        wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+        wifiInterferenceDevices.Add(wifi.Install(wifiPhy, wifiMac, wifiInterferenceApNodes));
+
+// 【MAC 聚合配置】这里控制 A-MPDU 聚合大小；聚合会影响 MAC 层发送效率、吞吐和丢包统计。
+        Config::Set("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_MaxAmpduSize",
+                    UintegerValue(BeMaxAmpduSize));
+    }
+
+    wifiDevices.Add(wifiStaDevices);
+    wifiDevices.Add(wifiApDevices);
+    wifiDevices.Add(wifiInterferenceDevices);
+
+
+    // Set guard interval
+    Config::Set(
+        "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/HtConfiguration/ShortGuardIntervalSupported",
+        BooleanValue(shortGuardInterval));
+
+    // Configure the mobility.
+    MobilityHelper mobilitySta;
+    mobilitySta.SetPositionAllocator ("ns3::GridPositionAllocator",
+                                 "MinX", DoubleValue (9.5),
+                                 "MinY", DoubleValue (0.0),
+                                 "DeltaX", DoubleValue (0.1),
+                                 "DeltaY", DoubleValue (0.1),
+                                 "GridWidth", UintegerValue (2),
+                                 "LayoutType", StringValue ("RowFirst"));
+    mobilitySta.SetMobilityModel ("ns3::RandomWalk2dMobilityModel",
+                                "Bounds", StringValue("0|20|0|0.1"),
+                                "Speed", StringValue ("ns3::ConstantRandomVariable[Constant=1.0]"));
+    mobilitySta.Install (wifiStaNodes);
+
+    MobilityHelper mobilityAp;
+    mobilityAp.SetPositionAllocator ("ns3::GridPositionAllocator",
+                                 "MinX", DoubleValue (0.0),
+                                 "MinY", DoubleValue (0.0),
+                                 "DeltaX", DoubleValue (19.9),
+                                 "DeltaY", DoubleValue (0.0),
+                                 "GridWidth", UintegerValue (2),
+                                 "LayoutType", StringValue ("RowFirst"));
+    mobilityAp.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+    mobilityAp.Install (wifiApNodes);
+
+    MobilityHelper mobilityInterferenceAp;
+    mobilityInterferenceAp.SetPositionAllocator ("ns3::GridPositionAllocator",
+                                 "MinX", DoubleValue (10.0),
+                                 "MinY", DoubleValue (5.0),
+                                 "DeltaX", DoubleValue (1),
+                                 "DeltaY", DoubleValue (1),
+                                 "GridWidth", UintegerValue (2),
+                                 "LayoutType", StringValue ("RowFirst"));
+    mobilityInterferenceAp.SetMobilityModel ("ns3::ConstantPositionMobilityModel");   
+    mobilityInterferenceAp.Install (wifiInterferenceApNodes);
+
+    Ptr<MobilityModel> mobility = wifiApNodes.Get(2)->GetObject<MobilityModel>();
+    Vector pos = mobility->GetPosition();
+    pos.x = 9.5;
+    pos.y = 9.6;
+    mobility->SetPosition(pos);
+
+    for (uint32_t i = 0; i < wifiInterferenceApNodes.GetN(); ++i)
+    {
+      Ptr<MobilityModel> mobility = wifiInterferenceApNodes.Get(i)->GetObject<MobilityModel>();
+      std::cout<<"Interference AP "<<i<<" position: "<<mobility->GetPosition()<<std::endl;
+    }
+    for (uint32_t i = 0; i < wifiStaNodes.GetN(); ++i)
+    {
+      Ptr<MobilityModel> mobility = wifiStaNodes.Get(i)->GetObject<MobilityModel>();
+      std::cout<<"STA "<<i<<" position: "<<mobility->GetPosition()<<std::endl;
+    }
+    for (uint32_t i = 0; i < wifiApNodes.GetN(); ++i)
+    {
+      Ptr<MobilityModel> mobility = wifiApNodes.Get(i)->GetObject<MobilityModel>();
+      std::cout<<"AP "<<i<<" position: "<<mobility->GetPosition()<<std::endl;
+    }
+
+    // Statistics counter
+    NodeStatistics atpCounter = NodeStatistics(wifiApDevices, wifiStaDevices);
+
+    // Move the AP by stepsSize meters every stepsTime seconds
+    Simulator::Schedule(Seconds(0.5 + stepsTime),
+                        &NodeStatistics::AdvancePosition,
+                        &atpCounter,
+                        wifiApNodes.Get(1),
+                        stepsSize,
+                        stepsTime);
+
+    // Move the AP to a random position within a rectangle every 5 seconds
+    Simulator::Schedule(Seconds(1), &NodeStatistics::RandomMoveWithinRectangle, &atpCounter, wifiApNodes.Get(1));
+
+
+    // Move the InferenceNode by stepsSize meters every stepsTime seconds
+    Simulator::Schedule(Seconds(0.5 + stepsTime),
+                        &NodeStatistics::AdvancePosition,
+                        &atpCounter,
+                        wifiInterferenceApNodes.Get(0),
+                        stepsSize,
+                        stepsTime);
+
+    // Configure the IP stack
+    InternetStackHelper stack;
+    stack.Install(wifiApNodes);
+    stack.Install(wifiStaNodes);
+    stack.Install(wifiInterferenceApNodes);
+    Ipv4AddressHelper address;
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer address_sta = address.Assign(wifiStaDevices);
+    Ipv4InterfaceContainer j = address.Assign(wifiApDevices);
+    Ipv4InterfaceContainer k = address.Assign(wifiInterferenceDevices);
+    Ipv4Address sinkAddress = address_sta.GetAddress(0);
+    Ipv4Address sinkAddress_2 = address_sta.GetAddress(1);
+    Ipv4Address sinkAddress_3 = address_sta.GetAddress(2);
+    Ipv4Address sinkAddress_4 = address_sta.GetAddress(3);
+
+    std::cout<<"ip of Ap 1 is: "<<j.GetAddress(0)<<std::endl;
+    std::cout<<"AP0 Mac address is: "<<wifiApDevices.Get(0)->GetAddress()<<std::endl;
+    
+
+    uint16_t port = 9;
+    uint16_t port2 = 10;
+    uint16_t port3 = 12;
+    uint16_t port4 = 14;
+    std::vector<uint16_t> ports;
+    ports.push_back(port);
+    ports.push_back(port2);
+    ports.push_back(port3);
+    ports.push_back(port4);
+
+    // Configure the CBR generator
+    PacketSinkHelper sink("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress, port));
+    ApplicationContainer apps_sink = sink.Install(wifiStaNodes.Get(0));
+    PacketSinkHelper sink_2("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress_2, port2));
+    ApplicationContainer apps_sink_2 = sink_2.Install(wifiStaNodes.Get(1));
+    PacketSinkHelper sink_3("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress_3, port3));
+    ApplicationContainer apps_sink_3 = sink_3.Install(wifiStaNodes.Get(2));
+    PacketSinkHelper sink_4("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress_4, port4));
+    ApplicationContainer apps_sink_4 = sink_4.Install(wifiStaNodes.Get(3));
+
+    // Configure Onoff for AP 1
+// 【发包业务源】OnOff 应用产生 UDP/CBR 流量，形成 MAC 层待发送数据包，触发速率选择逻辑。
+    OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(sinkAddress, port));
+    onoff.SetConstantRate(DataRate("60Mbps"), 1420);
+    ApplicationContainer apps_source = onoff.Install(wifiApNodes.Get(0));
+    apps_source.Start(Seconds(0.5));
+    apps_source.Stop(Seconds(simuTime));
+
+    //Configure Onoff for AP 2,3,4
+    for (uint32_t i = 1; i <wifiApNodes.GetN(); ++i)
+    {
+      std::cout<<"------\ninstalling onoff on ap: "<<i<<std::endl;
+      OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(address_sta.GetAddress(1), ports[1]));
+      onoff.SetConstantRate(DataRate("60Mbps"), 1420);
+      ApplicationContainer apps_source_2 = onoff.Install(wifiApNodes.Get(i));
+      apps_source_2.Start(Seconds(0.5));
+      apps_source_2.Stop(Seconds(simuTime));
+    }
+    OnOffHelper onoff_2("ns3::UdpSocketFactory", InetSocketAddress(address_sta.GetAddress(2), ports[2]));
+    onoff_2.SetConstantRate(DataRate("60Mbps"), 1420);
+    ApplicationContainer apps_source_2 = onoff_2.Install(wifiApNodes.Get(2));
+    apps_source_2.Start(Seconds(0.5));
+    apps_source_2.Stop(Seconds(simuTime));
+
+
+
+    for (uint32_t i = 0; i < wifiInterferenceApNodes.GetN(); ++i)
+    {
+      std::cout<<"------\ninstalling onoff on interference ap: "<<i<<std::endl;
+      OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(address_sta.GetAddress(1), ports[1]));
+      onoff.SetConstantRate(DataRate("60Mbps"), 1420);
+      ApplicationContainer apps_source_3 = onoff.Install(wifiInterferenceApNodes.Get(i));
+      apps_source_3.Start(Seconds(0.5));
+      apps_source_3.Stop(Seconds(simuTime));
+    }
+
+    //------------------------------------------------------------
+    //-- Setup stats and data collection
+    //--------------------------------------------
+
+    // // Register packet receptions to calculate throughput
+    Config::Connect("/NodeList/1/ApplicationList/*/$ns3::PacketSink/Rx",
+                    MakeCallback(&NodeStatistics::RxCallback, &atpCounter));
+
+    // // Callbacks to print every change of rate
+    Config::ConnectWithoutContextFailSafe(
+        "/NodeList/0/DeviceList/*/$ns3::WifiNetDevice/RemoteStationManager/$" + apManager + "/Rate",
+        MakeCallback(RateCallback));
+    
+
+    data.monitor = data.flowmon.InstallAll();
+    data.totalDelaySum = 0;
+    data.totalRxBytes = 0;
+    data.totalRxPackets = 0;
+    Ptr<PacketSink> sink1 = DynamicCast<PacketSink> (apps_sink.Get (0));
+    Ptr<PacketSink> sink2 = DynamicCast<PacketSink> (apps_sink_3.Get (0));
+    double lastTotalRx[2] = {0.0, 0.0}; // initial values
+    double interval = 1; // every 1 second
+    Simulator::Schedule(Seconds(2), &CalculateThroughput, sink1, sink2, lastTotalRx, interval);
+
+    Simulator::Stop(Seconds(simuTime));
+// 【仿真主循环】进入 ns-3 离散事件循环后，发包、接收、速率选择、状态上报和 AI 决策交替发生。
+    Simulator::Run();
+
+    double avgThroughputSta0 = sink1->GetTotalRx() * 8.0 / simuTime / (1024 * 1024);
+    std::cout << "Average Delay: " << data.averageDelay () << "ms" << std::endl;
+    std::cout << "Average Throughput (Sta 0): " << avgThroughputSta0
+        << "Mbps" << std::endl;
+
+    std::ofstream outFile;
+    outFile.open("avg_throughput_sta0.txt", std::ios_base::app);  // Open in append mode
+    if(outFile.is_open())
+    {
+        outFile << avgThroughputSta0 << std::endl;
+        outFile.close();
+    }
+    else
+    {
+        std::cerr << "Unable to open file for writing!" << std::endl;
+    }
+    EndSimulation();
+
+    std::ofstream outfile("throughput-" + outputFileName + ".plt");
+    Gnuplot gnuplot = Gnuplot("throughput-" + outputFileName + ".eps", "Throughput");
+    gnuplot.SetTerminal("post eps color enhanced");
+    gnuplot.SetLegend("Time (seconds)", "Throughput (Mb/s)");
+    gnuplot.SetTitle("Throughput (AP to STA) vs time");
+    gnuplot.AddDataset(atpCounter.GetDatafile());
+    gnuplot.GenerateOutput(outfile);
+
+    Simulator::Destroy();
+
+
+    return 0;
+}
+
+namespace
+{
+
+struct Scenario1Sampler
+{
+    Ptr<PacketSink> sink;
+    Ptr<MobilityModel> apMobility;
+    Ptr<MobilityModel> staMobility;
+    std::ofstream* output;
+    uint64_t previousRxBytes{0};
+    double interval{0.5};
+    double stopTime{80.0};
+};
+
+void
+SampleScenario1Throughput(Scenario1Sampler* sampler)
+{
+    const double now = Simulator::Now().GetSeconds();
+    const uint64_t totalRxBytes = sampler->sink->GetTotalRx();
+    const uint64_t intervalRxBytes = totalRxBytes - sampler->previousRxBytes;
+    const double throughputMbps = intervalRxBytes * 8.0 / sampler->interval / 1e6;
+    const double distance = CalculateDistance(sampler->apMobility->GetPosition(),
+                                              sampler->staMobility->GetPosition());
+
+    *sampler->output << now << ',' << distance << ',' << throughputMbps << '\n';
+    sampler->previousRxBytes = totalRxBytes;
+
+    if (now + sampler->interval < sampler->stopTime)
+    {
+        Simulator::Schedule(Seconds(sampler->interval),
+                            &SampleScenario1Throughput,
+                            sampler);
+    }
+}
+
+} // namespace
+
+int
+main(int argc, char* argv[])
+{
+    double simulationTime = 80.0;
+    double trafficStartTime = 0.5;
+    double startDistance = 1.0;
+    double movingSpeed = 0.5;
+    double sampleInterval = 0.5;
+    uint32_t packetSize = 1420;
+    uint32_t seed = 1;
+    uint32_t run = 1;
+    std::string dataRate = "60Mbps";
+    std::string rateManager = "ns3::IdealWifiManager";
+    std::string outputFile = "my-project-results/round2-scenario1.csv";
+
+    CommandLine cmd(__FILE__);
+    cmd.AddValue("simulationTime", "Simulation duration in seconds", simulationTime);
+    cmd.AddValue("trafficStartTime", "UDP traffic start time", trafficStartTime);
+    cmd.AddValue("startDistance", "Initial AP-to-STA distance in metres", startDistance);
+    cmd.AddValue("movingSpeed", "STA speed away from the AP in m/s", movingSpeed);
+    cmd.AddValue("sampleInterval", "Throughput sample interval in seconds", sampleInterval);
+    cmd.AddValue("packetSize", "UDP payload size in bytes", packetSize);
+    cmd.AddValue("dataRate", "Offered UDP load", dataRate);
+    cmd.AddValue("rateManager", "AP WifiRemoteStationManager TypeId", rateManager);
+    cmd.AddValue("outputFile", "Distance-throughput CSV path", outputFile);
+    cmd.AddValue("Seed", "ns-3 RNG seed", seed);
+    cmd.AddValue("Run", "ns-3 RNG run", run);
+    cmd.Parse(argc, argv);
+
+    if (simulationTime <= trafficStartTime || sampleInterval <= 0.0 || packetSize == 0)
+    {
+        std::cerr << "Invalid Scenario 1 timing or packet size" << std::endl;
+        return 1;
+    }
+
+    RngSeedManager::SetSeed(seed);
+    RngSeedManager::SetRun(run);
+
+    NodeContainer nodes;
+    nodes.Create(2);
+
+    MobilityHelper mobility;
+    Ptr<ListPositionAllocator> positions = CreateObject<ListPositionAllocator>();
+    positions->Add(Vector(0.0, 0.0, 0.0));
+    positions->Add(Vector(startDistance, 0.0, 0.0));
+    mobility.SetPositionAllocator(positions);
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(nodes.Get(0));
+    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
+    mobility.Install(nodes.Get(1));
+    Ptr<ConstantVelocityMobilityModel> movingSta =
+        nodes.Get(1)->GetObject<ConstantVelocityMobilityModel>();
+    movingSta->SetVelocity(Vector(movingSpeed, 0.0, 0.0));
+
+    YansWifiChannelHelper channel;
+    channel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
+    channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel",
+                               "Exponent", DoubleValue(3.0),
+                               "ReferenceLoss", DoubleValue(66.6777));
+
+    YansWifiPhyHelper phy;
+    phy.SetChannel(channel.Create());
+    phy.SetErrorRateModel("ns3::NistErrorRateModel");
+    phy.Set("ChannelSettings", StringValue("{36, 20, BAND_5GHZ, 0}"));
+    phy.Set("TxPowerStart", DoubleValue(20.0));
+    phy.Set("TxPowerEnd", DoubleValue(20.0));
+    phy.Set("TxPowerLevels", UintegerValue(1));
+    phy.Set("RxNoiseFigure", DoubleValue(0.0));
+    phy.DisablePreambleDetectionModel();
+
+    WifiHelper wifi;
+    wifi.SetStandard(WIFI_STANDARD_80211n);
+    WifiMacHelper mac;
+    Ssid ssid("round2-scenario1");
+
+    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                 "DataMode", StringValue("HtMcs0"),
+                                 "ControlMode", StringValue("HtMcs0"));
+    mac.SetType("ns3::StaWifiMac",
+                "Ssid", SsidValue(ssid),
+                "ActiveProbing", BooleanValue(false));
+    NetDeviceContainer staDevice = wifi.Install(phy, mac, nodes.Get(1));
+
+    wifi.SetRemoteStationManager(rateManager);
+    mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+    NetDeviceContainer apDevice = wifi.Install(phy, mac, nodes.Get(0));
+
+    InternetStackHelper internet;
+    internet.Install(nodes);
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.2.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer apInterface = ipv4.Assign(apDevice);
+    Ipv4InterfaceContainer staInterface = ipv4.Assign(staDevice);
+
+    const uint16_t port = 5000;
+    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
+                                InetSocketAddress(Ipv4Address::GetAny(), port));
+    ApplicationContainer sinkApps = sinkHelper.Install(nodes.Get(1));
+    sinkApps.Start(Seconds(0.0));
+    sinkApps.Stop(Seconds(simulationTime));
+
+    OnOffHelper source("ns3::UdpSocketFactory",
+                       InetSocketAddress(staInterface.GetAddress(0), port));
+    source.SetConstantRate(DataRate(dataRate), packetSize);
+    ApplicationContainer sourceApps = source.Install(nodes.Get(0));
+    sourceApps.Start(Seconds(trafficStartTime));
+    sourceApps.Stop(Seconds(simulationTime));
+
+    mkdir("my-project-results", 0755);
+    std::ofstream samples(outputFile);
+    if (!samples.is_open())
+    {
+        std::cerr << "Unable to open output file: " << outputFile << std::endl;
+        return 1;
+    }
+    samples << "time_s,distance_m,throughput_mbps\n";
+
+    Scenario1Sampler sampler;
+    sampler.sink = DynamicCast<PacketSink>(sinkApps.Get(0));
+    sampler.apMobility = nodes.Get(0)->GetObject<MobilityModel>();
+    sampler.staMobility = nodes.Get(1)->GetObject<MobilityModel>();
+    sampler.output = &samples;
+    sampler.interval = sampleInterval;
+    sampler.stopTime = simulationTime;
+    Simulator::Schedule(Seconds(trafficStartTime + sampleInterval),
+                        &SampleScenario1Throughput,
+                        &sampler);
+
+    Simulator::Stop(Seconds(simulationTime));
+    Simulator::Run();
+
+    const double measurementTime = simulationTime - trafficStartTime;
+    const double meanThroughput = sampler.sink->GetTotalRx() * 8.0 /
+                                  measurementTime / 1e6;
+    Ptr<WifiNetDevice> apWifiDevice = DynamicCast<WifiNetDevice>(apDevice.Get(0));
+    Ptr<IdealWifiManager> idealManager =
+        DynamicCast<IdealWifiManager>(apWifiDevice->GetRemoteStationManager());
+    if (idealManager)
+    {
+        std::cout << "IdealDataDecisions=" << idealManager->GetDataDecisionCount()
+                  << std::endl;
+    }
+    std::cout << "Scenario1 manager=" << rateManager
+              << " seed=" << seed
+              << " samples=" << (simulationTime - trafficStartTime) / sampleInterval - 1
+              << " meanThroughputMbps=" << meanThroughput
+              << " output=" << outputFile << std::endl;
+
+    samples.close();
+    Simulator::Destroy();
+    return 0;
+}

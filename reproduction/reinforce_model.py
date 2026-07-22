@@ -103,14 +103,16 @@ class ReinforceAgent:
         returns = torch.tensor(returns)
         if returns.std() > 0:
             returns = (returns - returns.mean()) / (returns.std() + self.eps)
-            
+
 #计算策略损失
         for log_probability, cumulative_return in zip(self.saved_log_probs, returns):
             policy_loss.append(-log_probability * cumulative_return)
-
+#清空旧梯度
         self.optimizer.zero_grad()
+#合并损失 反向传播
         loss = torch.cat(policy_loss).sum()
         loss.backward()
+#修改网络参数
         self.optimizer.step()
 
         del self.rewards[:]

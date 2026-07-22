@@ -25,16 +25,14 @@ RESULTS = ROOT / "my-project-results"
 
 #源码奖励使用的单空间流吞吐参考表，第一轮基准不修改、不裁剪
 REFERENCE_THROUGHPUT_MBPS = {
-    20: [5.4, 9.8, 13.6, 16.9, 22.2, 26.1, 28.1, 29.6],
+    20: [5.4, 9.8, 13.6, 17.5, 23.0, 26.1, 28.1, 29.6],
     40: [13.5, 27.0, 40.5, 54.0, 81.0, 108.0, 121.5, 135.0],
 }
 
 
-def calculate_reward(achieved_throughput, mcs_index, channel_bandwidth):
-    """源码奖励：MCS/7乘以归一化吞吐量的三次方。"""
-    maximum_throughput = REFERENCE_THROUGHPUT_MBPS[channel_bandwidth][mcs_index]
-    ratio = achieved_throughput / maximum_throughput
-    return (mcs_index / 7.0) * (ratio ** 3)
+def calculate_reward(achieved_throughput, offered_load=60.0):
+      ratio = achieved_throughput / offered_load
+      return float(np.clip(ratio, 0.0, 1.0))
 
 
 class ReinrateContainer:

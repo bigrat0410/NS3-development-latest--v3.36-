@@ -13,12 +13,13 @@
 #include "ns3/wifi-tx-vector.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace ns3
 {
 
-static_assert (sizeof (AiConstantRateEnv) == 28,
+static_assert (sizeof (AiConstantRateEnv) == 42,
                "Observation layout must match Python ctypes _pack_=1");
 static_assert (sizeof (AiConstantRateAct) == 2,
                "Action layout must match Python ctypes _pack_=1");
@@ -49,6 +50,11 @@ RLRateEnv::GetTypeId ()
                          BooleanValue (false),
                          MakeBooleanAccessor (&RLRateEnv::m_enableAi),
                          MakeBooleanChecker ())
+          .AddAttribute ("DecisionPerAmpdu",
+                         "Select the next MCS after each completed PPDU/A-MPDU attempt",
+                         BooleanValue (false),
+                         MakeBooleanAccessor (&RLRateEnv::m_decisionPerAmpdu),
+                         MakeBooleanChecker ())
           .AddAttribute ("MeasurementStart",
                          "Time when application payload accounting begins",
                          TimeValue (Seconds (0.5)),
@@ -64,11 +70,6 @@ RLRateEnv::GetTypeId ()
                          UintegerValue (20),
                          MakeUintegerAccessor (&RLRateEnv::m_decisionPacketWindow),
                          MakeUintegerChecker<std::uint32_t> (1, 65535))
-          .AddAttribute ("RewardDiscount",
-                         "Discount applied to successive DATA-packet rewards in one decision window",
-                         DoubleValue (0.99),
-                         MakeDoubleAccessor (&RLRateEnv::m_rewardDiscount),
-                         MakeDoubleChecker<double> (0.0, 1.0))
           .AddAttribute ("PayloadSize",
                          "Effective UDP payload bytes represented by one successful MPDU",
                          UintegerValue (1420),
@@ -202,13 +203,14 @@ RLRateEnv::CompletePacket (bool success)
       return;
     }
 
-  const double packetSeconds = m_currentPacketAirtime.GetSeconds ();
-  const double packetThroughputMbps =
-      success && packetSeconds > 0.0
-          ? static_cast<double> (m_payloadSize) * 8.0 / packetSeconds / 1e6
-          : 0.0;
-  m_windowReward += std::pow (m_rewardDiscount, m_completedPackets) *
-                    GetPacketReward (packetThroughputMbps);
+  if (success)
+    {
+      ++m_windowSuccessfulPackets;
+    }
+  else
+    {
+      ++m_windowFailedPackets;
+    }
   ++m_completedPackets;
   m_currentPacketAirtime = Seconds (0);
 
@@ -218,28 +220,69 @@ RLRateEnv::CompletePacket (bool success)
     }
 }
 
-double
-RLRateEnv::GetPacketReward (double packetThroughputMbps) const
-{
-  static const double referenceThroughputMbps[] = {5.4, 9.8, 13.6, 16.9,
-                                                    22.2, 26.1, 28.1, 29.6};
-  const std::uint8_t mcs = GetCurrentMcs ();
-  const double ratio = std::min (packetThroughputMbps / referenceThroughputMbps[mcs], 1.0);
-  return (static_cast<double> (mcs) / 7.0) * ratio * ratio * ratio;
-}
-
 void
 RLRateEnv::PrepareWindowObservation ()
 {
-  const double transmissionSeconds = m_transmissionAirtime.GetSeconds ();
+  const double elapsedSeconds = m_actionStartSet
+                                    ? (Simulator::Now () - m_actionStart).GetSeconds ()
+                                    : 0.0;
 
-  //成功有效载荷除以当前20包窗口DATA尝试的PHY传输时间；失败重传时间也包含在分母中。
-  m_throughput = transmissionSeconds > 0.0
+  // Use elapsed simulation time so retries, contention, inter-frame spacing,
+  // and ACK handling all reduce the application-payload goodput.
+  m_throughput = elapsedSeconds > 0.0
                      ? static_cast<double> (m_successfulPayloadBytes) * 8.0 /
-                           transmissionSeconds /
-                           (1024.0 * 1024.0)
+                           elapsedSeconds / 1e6
                      : 0.0;
+  static constexpr std::array<double, 8> dataRates20Mhz = {
+      5.4, 9.8, 13.6, 17.5, 23.0, 26.1, 28.1, 29.6};
+  const std::uint8_t mcs = GetCurrentMcs ();
+  const double efficiency = m_throughput / dataRates20Mhz[mcs];
+  // Preserve the source reward shape and 20-packet scale, but base it on
+  // wall-clock goodput rather than DATA-only PHY airtime.
+  m_rawReward = static_cast<double> (m_completedPackets) *
+                (static_cast<double> (mcs) / 7.0) *
+                efficiency * efficiency * efficiency;
+  m_observationAggregateMpdus = static_cast<std::uint16_t> (m_completedPackets);
+  m_observationSuccessfulMpdus = m_windowSuccessfulPackets;
+  m_observationFailedMpdus = m_windowFailedPackets;
   m_observationReady = true;
+}
+
+void
+RLRateEnv::FlushPendingWindow ()
+{
+  if (!m_enableAi || m_station == nullptr || m_observationReady ||
+      m_completedPackets == 0)
+    {
+      return;
+    }
+  PrepareWindowObservation ();
+  ExchangeWithAgent (m_station);
+}
+
+void
+RLRateEnv::PrepareAmpduObservation (WifiRemoteStation* station,
+                                    std::uint16_t nSuccessfulMpdus,
+                                    std::uint16_t nFailedMpdus)
+{
+  if (!m_initialActionSelected || !m_actionStartSet
+      || Simulator::Now () < m_measurementStart
+      || nSuccessfulMpdus + nFailedMpdus == 0)
+    {
+      return;
+    }
+
+  const double elapsedSeconds = (Simulator::Now () - m_actionStart).GetSeconds ();
+  m_throughput = elapsedSeconds > 0.0
+                     ? static_cast<double> (nSuccessfulMpdus) * m_payloadSize * 8.0 /
+                           elapsedSeconds / 1e6
+                     : 0.0;
+  m_rawReward = m_throughput;
+  m_observationSuccessfulMpdus = nSuccessfulMpdus;
+  m_observationFailedMpdus = nFailedMpdus;
+  m_observationAggregateMpdus = nSuccessfulMpdus + nFailedMpdus;
+  m_observationReady = true;
+  ExchangeWithAgent (station);
 }
 
 void
@@ -248,8 +291,13 @@ RLRateEnv::ResetWindow ()
   m_successfulPayloadBytes = 0;
   m_transmissionAirtime = Seconds (0);
   m_currentPacketAirtime = Seconds (0);
-  m_windowReward = 0.0;
+  m_rawReward = 0.0;
   m_completedPackets = 0;
+  m_windowSuccessfulPackets = 0;
+  m_windowFailedPackets = 0;
+  m_observationAggregateMpdus = 0;
+  m_observationSuccessfulMpdus = 0;
+  m_observationFailedMpdus = 0;
   m_windowHadAttempt = false;
 }
 
@@ -325,7 +373,11 @@ RLRateEnv::ExchangeWithAgent (WifiRemoteStation* station)
   env->cw = m_cw;
   env->throughput = std::isfinite (m_throughput) ? m_throughput : 0.0;
   env->snr = std::isfinite (m_snr) ? m_snr : 0.0;
-  env->reward = std::isfinite (m_windowReward) ? m_windowReward : 0.0;
+  env->raw_reward = std::isfinite (m_rawReward) ? m_rawReward : 0.0;
+  env->simulation_time = Simulator::Now ().GetSeconds ();
+  env->aggregate_mpdus = m_observationAggregateMpdus;
+  env->successful_mpdus = m_observationSuccessfulMpdus;
+  env->failed_mpdus = m_observationFailedMpdus;
   m_msgInterface->CppSendEnd ();
 
   // Python写Action，C++读取；该等待由ns3-ai信号量同步
@@ -342,6 +394,8 @@ RLRateEnv::ExchangeWithAgent (WifiRemoteStation* station)
       ResetWindow ();
     }
   m_initialActionSelected = true;
+  m_actionStart = Simulator::Now ();
+  m_actionStartSet = true;
 }
 
 void
@@ -350,7 +404,10 @@ RLRateEnv::DoReportRxOk (WifiRemoteStation* station,
                          WifiMode txMode)
 {
   NS_LOG_FUNCTION (this << station << rxSnr << txMode);
-  m_snr = rxSnr;//发送端最近收到的ACK/CTS方向SNR
+  if (std::isfinite (rxSnr) && rxSnr > 0.0)
+    {
+      m_snr = rxSnr;//发送端最近收到的有效ACK/CTS方向SNR
+    }
 }
 
 void
@@ -376,7 +433,10 @@ RLRateEnv::DoReportRtsOk (WifiRemoteStation* station,
                           double rtsSnr)
 {
   NS_LOG_FUNCTION (this << station << ctsSnr << ctsMode << rtsSnr);
-  m_snr = ctsSnr;
+  if (std::isfinite (ctsSnr) && ctsSnr > 0.0)
+    {
+      m_snr = ctsSnr;
+    }
 }
 
 void
@@ -389,7 +449,10 @@ RLRateEnv::DoReportDataOk (WifiRemoteStation* station,
 {
   NS_LOG_FUNCTION (this << station << ackSnr << ackMode << dataSnr
                         << dataChannelWidth << +dataNss);
-  m_snr = ackSnr;//固定底噪下，ACK SNR与论文使用的ACK RSS一一对应
+  if (std::isfinite (ackSnr) && ackSnr > 0.0)
+    {
+      m_snr = ackSnr;//固定底噪下，ACK SNR与论文使用的ACK RSS一一对应
+    }
   if (!m_ampduEnabled)
     {
       //禁用A-MPDU时，一个普通DATA成功对应一个1420字节有效负载
@@ -410,7 +473,15 @@ RLRateEnv::DoReportAmpduTxStatus (WifiRemoteStation* station,
 {
   NS_LOG_FUNCTION (this << station << nSuccessfulMpdus << nFailedMpdus
                         << rxSnr << dataSnr << dataChannelWidth << +dataNss);
-  m_snr = rxSnr;//A-MPDU使用Block ACK，因此保存Block ACK的SNR
+  if (std::isfinite (rxSnr) && rxSnr > 0.0)
+    {
+      m_snr = rxSnr;//丢失Block ACK时保留最近一次有效SNR
+    }
+  if (m_decisionPerAmpdu)
+    {
+      PrepareAmpduObservation (station, nSuccessfulMpdus, nFailedMpdus);
+      return;
+    }
   RecordTransmissionAirtime (station, nSuccessfulMpdus + nFailedMpdus);
   if (nSuccessfulMpdus > 0)
     {
@@ -478,7 +549,7 @@ WifiTxVector
 RLRateEnv::DoGetDataTxVector (WifiRemoteStation* station)
 {
   NS_LOG_FUNCTION (this << station);
-  // 第一个业务包前选择初始动作；之后仅在20个DATA包完成时交换下一动作。
+  // 第一个业务包前选择初始动作；后续由所选决策模式触发下一次交换。
   m_station = station;
   if (m_enableAi && Simulator::Now () >= m_measurementStart
       && (!m_initialActionSelected || m_observationReady))
@@ -486,7 +557,7 @@ RLRateEnv::DoGetDataTxVector (WifiRemoteStation* station)
       if (!m_initialActionSelected)
         {
           m_throughput = 0.0;
-          m_windowReward = 0.0;
+          m_rawReward = 0.0;
           m_observationReady = true;
         }
       ExchangeWithAgent (station);
