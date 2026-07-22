@@ -1736,3 +1736,82 @@ episode  throughput(Mbps)  entropy   冻结策略动作
   其中 training CSV、checkpoint、final policy 和最终 SVG 的实际终点均为
   episode 600。最终 SVG 含 episode 50-600 的 12 条冻结曲线：
   `my-project-results/reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-rewardshift-300-validation-every-50-episodes.svg`。
+
+## 2026-07-22 - RTX 5060 CUDA 12.8 训练环境
+
+- 原环境为 `torch 2.12.1+cu130`，RTX 5060 驱动 572.90 只支持 CUDA
+  Driver API 12.8，因此 `torch.cuda.is_available()` 为 false，训练实际使用 CPU。
+- 改装为 `torch 2.7.1+cu128`，CUDA 12.8 依赖从南京大学国内镜像安装。
+  实测识别 `NVIDIA GeForce RTX 5060 Laptop GPU`、compute capability 12.0，
+  CUDA 矩阵乘法、反向传播和 Adam 更新均通过。
+- offline agent 新增 `device=auto|cpu|cuda`；`auto` 默认在 CUDA 可用时使用
+  GPU，`--device cuda` 会在 CUDA 不可用时直接报错，禁止静默回退 CPU。
+- 为避免约 1700 次单样本 CUDA kernel 调用，逐窗口动作推理由 CPU 策略副本
+  完成；完整 80 s 轨迹结束后一次性把批量状态迁到 GPU，进行 advantage、
+  loss、反向传播和 Adam 更新，再同步一次 CPU 推理副本。96 个分箱统计已用
+  `bincount/scatter_add` 向量化，CPU/GPU loss 差约 `7.5e-9`。
+- 完整 80 s 对照：CPU 约 4.90 s；GPU 首轮因 CUDA 初始化约 8.49 s，第二轮
+  稳态约 4.77 s。GPU 已生效，但加速有限，因为主要耗时在 ns-3 仿真与共享
+  内存交互，网络只有 159,496 个参数且每个 episode 只更新一次。
+
+## 2026-07-22 - 0.85 指数 MCS 奖励的 300 轮实验
+
+- 保持 default ns-3 构建和现有算法不变，仅将奖励中 MCS 权重从
+  `(mcs+1)/8` 改为 `0.85**(7-mcs)`。Python 状态里的 `(mcs+1)/8`
+  仍是状态特征，没有误改。新实验从随机初始模型开始，使用 CUDA。
+- 冻结验证策略演化：episode 50 为全局 MCS7；100 为 MCS7/MCS1；
+  150 仍为 MCS7/MCS1；200 为 MCS7/MCS2/MCS1；250 首次稳定出现
+  MCS0，为 MCS7/MCS2/MCS1/MCS0；300 保持相同四段。
+- episode 300 的距离分段约为：`1-10.67 m MCS7`、`10.68-29.54 m MCS2`、
+  `29.55-37.19 m MCS1`、`37.20-41 m MCS0`。窗口计数分别为
+  MCS7=2487、MCS2=2331、MCS1=681、MCS0=187，说明新奖励确实解决了
+  贪心策略远端不出现 MCS0 的问题。
+- 验证吞吐量从 episode 200 的 16.289 Mbps 到 250 的 16.348 Mbps，
+  episode 300 为 16.313 Mbps。250-300 分段结构稳定，loss 已降至
+  -0.00256、梯度范数 0.0549、熵 0.1502，因此不续训到 500；预期继续
+  训练主要是小幅调整边界，而不是新增关键分区。
+- 最终合并 SVG：
+  `my-project-results/reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-reward085pow-300-validation-every-50-episodes.svg`。
+
+## 2026-07-22 - 1 m 固定 MCS 参考速率重新校准
+
+- 检查确认旧表 `[5.4,9.8,13.6,17.5,23.0,26.1,28.1,29.6]`
+  不是全部本地实测：主体来自 REINRATE，仅 MCS3/MCS4 曾被调整。
+  在上一次 300 轮数据里，八个 MCS 都出现过
+  `(window_goodput/reference)^3 > 1`，最大为 MCS7 的约 1.485。
+- 新增 `calibrate_mcs_references.py`，用 default ns-3、seed 990001、固定
+  1 m、速度 0、A-MPDU 关闭、20 包窗口，对 MCS0-7 分别强制运行
+  40 s。完整窗口数从 MCS0 的 964 到 MCS7 的 5260。
+- 八个 MCS 的实测最大窗口 goodput 为
+  `[5.659,10.523,14.733,18.470,24.533,29.350,31.639,33.505] Mbps`。
+  为公平起见，八档都采用相同规则：“40 s 完整窗口最大值向上取
+  0.1 Mbps”，新表为 `[5.7,10.6,14.8,18.5,24.6,29.4,31.7,33.6]`。
+- 用新表回算所有校准窗口，八档最大 ratio 为 0.993-0.998，最大
+  ratio 三次方为 0.978-0.995，全部不超过 1。default 可执行文件已
+  按新表重编。
+- 之前分析中的 `10.67-20 m` 是为了概括最终连续 MCS2 策略段而
+  做的事后距离汇总，不是训练 advantage 分箱。训练仍然使用 95 个
+  0.5 dB SNR 局部分箱；该粗汇总不能用来判断分箱是否足够细。
+
+## 2026-07-22 - `(mcs+2)/9` 奖励的 1000 轮收敛结果
+
+- 在新校准参考表 `[5.7,10.6,14.8,18.5,24.6,29.4,31.7,33.6]`
+  上，将 MCS 奖励系数改为 `(mcs+2)/9`。其余保持 95 个 0.5 dB
+  局部 advantage 分箱、pi/q、熵 0.05、每条 80 s 轨迹只更新一次。
+- 先训练到 500 轮；因 400 轮新增 MCS0、500 轮新增 MCS6，判定未
+  收敛并续训至 800，随后按用户要求续训到 1000。每 100 轮做一次
+  冻结验证，最终 SVG 包含 10 条曲线。
+- 验证吞吐量：100/200/300/400/500 轮分别为
+  `7.921/16.814/17.282/17.367/17.562 Mbps`；600 轮新增 MCS4 后跃升至
+  `18.420 Mbps`；700-1000 轮稳定在 `18.438/18.458/18.448/18.453 Mbps`。
+- episode 1000 主要距离分段为：`1.25-10.07 m MCS7`、
+  `10.07-11.24 m MCS6`、`11.25-17.66 m MCS4`、`17.67-22.49 m MCS3`、
+  `22.49-30.07 m MCS2`、`30.08-37.81 m MCS1`、`37.82-41 m MCS0`。
+  边界处有两个单窗口 MCS2/MCS3 交错，不影响主分段。
+- 600-1000 轮动作集合和主要边界稳定，吞吐波动小于 0.04 Mbps；
+  episode 1000 梯度范数为 0.01986，熵为 0.04343，判定已收敛。
+  最终贪心策略包含 7 个 MCS，唯一未选中的是 MCS5。
+- 最终 SVG：
+  `my-project-results/reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-rewardmcs2over9-500-validation-every-100-episodes.svg`。
+  文件前缀保留初始 `-500`名称，但 history、checkpoint、final policy 和 SVG
+  的实际终点均为 episode 1000。

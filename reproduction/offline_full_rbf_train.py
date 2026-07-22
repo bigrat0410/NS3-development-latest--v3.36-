@@ -16,12 +16,12 @@ from offline_reinforce_model import ReinRateAgent
 from offline_reinforce_train import RESULTS, ROOT, create_interface, run_episode
 
 
-PREFIX = "reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-rewardshift-300"
+PREFIX = "reproduction-scenario1-offline-full-rbf05dbadv-piq-entropy05-rewardmcs2over9-500"
 RUN_LABEL = PREFIX.removeprefix("reproduction-scenario1-")
 RBF_CENTERS_DB = np.arange(5.0, 52.0 + 1e-9, 0.5, dtype=np.float32)
 RBF_SIGMA_DB = 0.6
 ENTROPY_COEF = 0.05
-MAX_REFERENCE_MBPS = 29.6
+MAX_REFERENCE_MBPS = 33.6
 
 
 def rbf_policy_state(observation):
@@ -62,7 +62,7 @@ def rbf_policy_state(observation):
 class RbfImportanceEntropyAgent(ReinRateAgent):
     """Importance-corrected policy gradient with per-dB-bin advantages."""
 
-    def __init__(self, state_size, lr, gamma, epsilon, entropy_coef):
+    def __init__(self, state_size, lr, gamma, epsilon, entropy_coef, device="auto"):
         super().__init__(
             state_size=state_size,
             action_size=8,
@@ -73,6 +73,7 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
             normalize_returns=False,
             loss_reduction="mean",
             use_behavior_probability=False,
+            device=device,
         )
         self.entropy_coef = entropy_coef
         self.rbf_centers_db = RBF_CENTERS_DB.tolist()
@@ -82,9 +83,19 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
     def finish_episode(self):
         if not self.rewards:
             raise RuntimeError("cannot finish an empty episode")
-        returns = torch.tensor(self.rewards, dtype=torch.float32)
-        states = torch.stack(self.states)
-        actions = torch.tensor(self.actions, dtype=torch.long)
+        states_cpu = torch.stack(self.states)
+        valid_cpu = states_cpu[:, len(RBF_CENTERS_DB)] > 0.5
+        peak_cpu = states_cpu[:, :len(RBF_CENTERS_DB)].argmax(dim=1)
+        invalid_bin = len(RBF_CENTERS_DB)
+        bin_ids_cpu = torch.where(
+            valid_cpu, peak_cpu, torch.full_like(peak_cpu, invalid_bin)
+        )
+        returns = torch.tensor(
+            self.rewards, dtype=torch.float32, device=self.device
+        )
+        states = states_cpu.to(self.device)
+        actions = torch.tensor(self.actions, dtype=torch.long, device=self.device)
+        bin_ids = bin_ids_cpu.to(self.device)
         probabilities = self.policy(states)
         selected_pi = probabilities.gather(1, actions.unsqueeze(1)).squeeze(1)
         selected_q = (
@@ -95,50 +106,38 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
         log_pi = torch.log(selected_pi + 1e-8)
         entropy = -(probabilities * torch.log(probabilities + 1e-8)).sum(dim=1)
 
-        valid = states[:, len(RBF_CENTERS_DB)] > 0.5
-        peak = states[:, :len(RBF_CENTERS_DB)].argmax(dim=1)
-        invalid_bin = len(RBF_CENTERS_DB)
-        bin_ids = torch.where(valid, peak, torch.full_like(peak, invalid_bin))
-        bin_losses = []
-        bin_counts = []
-        bin_reward_means = []
-        bin_reward_stds = []
-        bin_advantage_mins = []
-        bin_advantage_maxs = []
-        bin_entropies = []
-        for index in range(len(RBF_CENTERS_DB) + 1):
-            mask = bin_ids == index
-            count = int(mask.sum().item())
-            bin_counts.append(count)
-            if count:
-                rewards_bin = returns[mask]
-                reward_mean = rewards_bin.mean()
-                reward_std = rewards_bin.std(unbiased=False)
-                if count >= 2 and reward_std.item() > 1e-8:
-                    advantages_bin = (
-                        rewards_bin - reward_mean
-                    ) / (reward_std + 1e-8)
-                else:
-                    advantages_bin = torch.zeros_like(rewards_bin)
-                actor_loss = -(
-                    importance[mask]
-                    * log_pi[mask]
-                    * advantages_bin.detach()
-                ).mean()
-                entropy_bin = entropy[mask].mean()
-                bin_losses.append(actor_loss - self.entropy_coef * entropy_bin)
-                bin_reward_means.append(float(reward_mean.item()))
-                bin_reward_stds.append(float(reward_std.item()))
-                bin_advantage_mins.append(float(advantages_bin.min().item()))
-                bin_advantage_maxs.append(float(advantages_bin.max().item()))
-                bin_entropies.append(float(entropy_bin.item()))
-            else:
-                bin_reward_means.append(math.nan)
-                bin_reward_stds.append(math.nan)
-                bin_advantage_mins.append(math.nan)
-                bin_advantage_maxs.append(math.nan)
-                bin_entropies.append(math.nan)
-        loss = torch.stack(bin_losses).mean()
+        num_bins = len(RBF_CENTERS_DB) + 1
+        counts = torch.bincount(bin_ids, minlength=num_bins)
+        counts_f = counts.to(returns.dtype).clamp_min(1.0)
+        reward_sums = torch.zeros(num_bins, device=self.device).scatter_add_(
+            0, bin_ids, returns
+        )
+        reward_square_sums = torch.zeros(num_bins, device=self.device).scatter_add_(
+            0, bin_ids, returns.square()
+        )
+        reward_means = reward_sums / counts_f
+        reward_vars = (reward_square_sums / counts_f - reward_means.square()).clamp_min(0.0)
+        reward_stds = reward_vars.sqrt()
+        sample_stds = reward_stds[bin_ids]
+        eligible = (counts[bin_ids] >= 2) & (sample_stds > 1e-8)
+        advantages = torch.where(
+            eligible,
+            (returns - reward_means[bin_ids]) / (sample_stds + 1e-8),
+            torch.zeros_like(returns),
+        )
+        actor_samples = -importance * log_pi * advantages.detach()
+        actor_sums = torch.zeros(num_bins, device=self.device).scatter_add_(
+            0, bin_ids, actor_samples
+        )
+        entropy_sums = torch.zeros(num_bins, device=self.device).scatter_add_(
+            0, bin_ids, entropy
+        )
+        nonempty = counts > 0
+        bin_losses = (
+            actor_sums / counts_f
+            - self.entropy_coef * entropy_sums / counts_f
+        )
+        loss = bin_losses[nonempty].mean()
         if not torch.isfinite(loss):
             raise RuntimeError("non-finite per-bin policy loss")
 
@@ -151,7 +150,32 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
             if parameter.grad is not None
         )).item()
         self.optimizer.step()
+        self._sync_inference_policy()
         self.gradient_updates += 1
+        bin_counts = counts.detach().cpu().tolist()
+        means_cpu = reward_means.detach().cpu().tolist()
+        stds_cpu = reward_stds.detach().cpu().tolist()
+        entropy_cpu = (entropy_sums / counts_f).detach().cpu().tolist()
+        advantages_cpu = advantages.detach().cpu()
+        bin_reward_means = []
+        bin_reward_stds = []
+        bin_advantage_mins = []
+        bin_advantage_maxs = []
+        bin_entropies = []
+        for index, count in enumerate(bin_counts):
+            if count:
+                values = advantages_cpu[bin_ids_cpu == index]
+                bin_reward_means.append(means_cpu[index])
+                bin_reward_stds.append(stds_cpu[index])
+                bin_advantage_mins.append(float(values.min().item()))
+                bin_advantage_maxs.append(float(values.max().item()))
+                bin_entropies.append(entropy_cpu[index])
+            else:
+                bin_reward_means.append(math.nan)
+                bin_reward_stds.append(math.nan)
+                bin_advantage_mins.append(math.nan)
+                bin_advantage_maxs.append(math.nan)
+                bin_entropies.append(math.nan)
         result = {
             "update": self.gradient_updates,
             "loss": float(loss.item()),
@@ -194,11 +218,15 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
             "invalid_snr_bin": len(RBF_CENTERS_DB),
             "entropy_coef": self.entropy_coef,
             "state_size": len(RBF_CENTERS_DB) + 5,
-            "reward_mcs_factor": "(mcs+1)/8",
+            "reward_mcs_factor": "(mcs+2)/9",
             "advantage_normalization": "per_snr_bin",
             "updates_per_80s_episode": 1,
             "python_random_state": random.getstate(),
             "torch_random_state": torch.get_rng_state(),
+            "torch_cuda_random_state": (
+                torch.cuda.get_rng_state(self.device)
+                if self.device.type == "cuda" else None
+            ),
         })
         torch.save(checkpoint, path)
 
@@ -213,7 +241,7 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
             "invalid_snr_bin": len(RBF_CENTERS_DB),
             "entropy_coef": entropy_coef,
             "state_size": len(RBF_CENTERS_DB) + 5,
-            "reward_mcs_factor": "(mcs+1)/8",
+            "reward_mcs_factor": "(mcs+2)/9",
             "advantage_normalization": "per_snr_bin",
             "updates_per_80s_episode": 1,
             "gamma": gamma,
@@ -234,12 +262,14 @@ class RbfImportanceEntropyAgent(ReinRateAgent):
             torch.set_rng_state(checkpoint["torch_random_state"])
         else:
             torch.manual_seed(774015 + episode)
+        if self.device.type == "cuda" and checkpoint.get("torch_cuda_random_state") is not None:
+            torch.cuda.set_rng_state(checkpoint["torch_cuda_random_state"], self.device)
         return episode
 
 
-def plot_final_curves(episodes):
+def plot_final_curves(episodes, validate_every):
     plotter = ROOT / "scratch/reproduction/plot_training_episodes.py"
-    output = RESULTS / f"{PREFIX}-validation-every-50-episodes.svg"
+    output = RESULTS / f"{PREFIX}-validation-every-{validate_every}-episodes.svg"
     subprocess.run([
         sys.executable, "-B", str(plotter),
         "--input-glob", str(RESULTS / f"{PREFIX}-validation-episode*-seed*.csv"),
@@ -253,8 +283,8 @@ def plot_final_curves(episodes):
 
 def main():
     parser = argparse.ArgumentParser(description="Full 1-41 m per-bin-advantage RBF REINFORCE")
-    parser.add_argument("--maxEpisodes", type=int, default=300)
-    parser.add_argument("--validateEvery", type=int, default=50)
+    parser.add_argument("--maxEpisodes", type=int, default=500)
+    parser.add_argument("--validateEvery", type=int, default=100)
     parser.add_argument("--trainSeed", type=int, default=774015)
     parser.add_argument("--validationSeed", type=int, default=884015)
     parser.add_argument("--agentSeed", type=int, default=774015)
@@ -262,6 +292,7 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.0)
     parser.add_argument("--epsilon", type=float, default=0.3)
     parser.add_argument("--entropyCoef", type=float, default=ENTROPY_COEF)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if args.maxEpisodes < 1 or args.validateEvery < 1:
@@ -272,8 +303,10 @@ def main():
     torch.manual_seed(args.agentSeed)
     state_size = len(RBF_CENTERS_DB) + 5
     agent = RbfImportanceEntropyAgent(
-        state_size, args.learningRate, args.gamma, args.epsilon, args.entropyCoef
+        state_size, args.learningRate, args.gamma, args.epsilon, args.entropyCoef,
+        device=args.device,
     )
+    print(f"training_device={agent.device}", flush=True)
     RESULTS.mkdir(exist_ok=True)
     history = RESULTS / f"{PREFIX}-training.csv"
     checkpoint = RESULTS / f"{PREFIX}-checkpoint.pt"
@@ -377,7 +410,7 @@ def main():
                     flush=True,
                 )
     agent.save_policy(final_policy)
-    plot_final_curves(milestones)
+    plot_final_curves(milestones, args.validateEvery)
     del interface
     print(f"history={history}")
     print(f"final_policy={final_policy}")

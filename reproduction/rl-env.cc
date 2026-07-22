@@ -234,13 +234,13 @@ RLRateEnv::PrepareWindowObservation ()
                            elapsedSeconds / 1e6
                      : 0.0;
   static constexpr std::array<double, 8> dataRates20Mhz = {
-      5.4, 9.8, 13.6, 17.5, 23.0, 26.1, 28.1, 29.6};
+      5.7, 10.6, 14.8, 18.5, 24.6, 29.4, 31.7, 33.6};
   const std::uint8_t mcs = GetCurrentMcs ();
   const double efficiency = m_throughput / dataRates20Mhz[mcs];
   // Preserve the source reward shape and 20-packet scale, but base it on
   // wall-clock goodput rather than DATA-only PHY airtime.
   m_rawReward = static_cast<double> (m_completedPackets) *
-                ((static_cast<double> (mcs) + 1.0) / 8.0) *
+                ((static_cast<double> (mcs) + 2.0) / 9.0) *
                 efficiency * efficiency * efficiency;
   m_observationAggregateMpdus = static_cast<std::uint16_t> (m_completedPackets);
   m_observationSuccessfulMpdus = m_windowSuccessfulPackets;

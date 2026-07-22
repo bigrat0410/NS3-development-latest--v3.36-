@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import random
+import copy
 
 import torch
 import torch.nn as nn
@@ -37,14 +38,23 @@ class ReinRateAgent:
 
     def __init__(self, state_size=4, action_size=8, lr=1e-4, gamma=0.99, epsilon=0.3,
                  update_batch=None, normalize_returns=True, loss_reduction="mean",
-                 use_behavior_probability=False):
+                 use_behavior_probability=False, device="auto"):
         if not 0.0 <= gamma <= 1.0:
             raise ValueError("gamma must be in [0, 1]")
         if not 0.0 <= epsilon <= 1.0:
             raise ValueError("epsilon must be in [0, 1]")
         if loss_reduction not in ("mean", "sum"):
             raise ValueError("loss_reduction must be 'mean' or 'sum'")
-        self.policy = PolicyNetwork(state_size, action_size)
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        self.device = torch.device(device)
+        policy = PolicyNetwork(state_size, action_size)
+        self.policy = policy.to(self.device)
+        self.inference_policy = (
+            copy.deepcopy(policy).cpu() if self.device.type == "cuda" else self.policy
+        )
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.action_size = action_size
         self.gamma = gamma
@@ -72,7 +82,7 @@ class ReinRateAgent:
         MCS, otherwise SAMPLE from the softmax policy pi(a|s) (not argmax)."""
         state_tensor = torch.as_tensor(state, dtype=torch.float32).reshape(-1)
         with torch.no_grad():
-            probabilities = self.policy(state_tensor)
+            probabilities = self.inference_policy(state_tensor)
         self.last_exploratory = random.random() < self.epsilon
         if self.last_exploratory:
             action = random.randrange(self.action_size)
@@ -85,12 +95,12 @@ class ReinRateAgent:
     def select_greedy_action(self, state) -> int:
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float32).reshape(1, -1)
-            return int(torch.argmax(self.policy(state_tensor), dim=-1).item())
+            return int(torch.argmax(self.inference_policy(state_tensor), dim=-1).item())
 
     def action_probabilities(self, state):
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float32).reshape(1, -1)
-            return self.policy(state_tensor).squeeze(0).tolist()
+            return self.inference_policy(state_tensor).squeeze(0).tolist()
 
     def record_window(self, reward):
         """Align one completed 20-packet (or final partial) window to its action."""
@@ -117,9 +127,11 @@ class ReinRateAgent:
             discounted_returns.append(value)
         discounted_returns.reverse()
 
-        states = torch.stack(self.states)
-        actions = torch.tensor(self.actions, dtype=torch.long)
-        returns = torch.tensor(discounted_returns, dtype=torch.float32)
+        states = torch.stack(self.states).to(self.device)
+        actions = torch.tensor(self.actions, dtype=torch.long, device=self.device)
+        returns = torch.tensor(
+            discounted_returns, dtype=torch.float32, device=self.device
+        )
         # Paper Algorithm 1, line 13: normalize the returns. This subtracts a
         # per-episode baseline (mean) and scales by std, so that windows that did
         # better than the episode average get a positive weight and those that did
@@ -155,6 +167,7 @@ class ReinRateAgent:
             if parameter.grad is not None
         )).item()
         self.optimizer.step()
+        self._sync_inference_policy()
         self.gradient_updates += 1
 
         result = {
@@ -182,6 +195,14 @@ class ReinRateAgent:
             (parameter.detach() ** 2).sum() for parameter in self.policy.parameters()
         )).item()
 
+    def _sync_inference_policy(self):
+        if self.inference_policy is not self.policy:
+            state = {
+                name: tensor.detach().cpu()
+                for name, tensor in self.policy.state_dict().items()
+            }
+            self.inference_policy.load_state_dict(state)
+
     def reset_rollout(self):
         discarded = len(self.rewards)
         self.states.clear()
@@ -196,7 +217,10 @@ class ReinRateAgent:
         torch.save(self.policy.state_dict(), path)
 
     def load_policy(self, path):
-        self.policy.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        self.policy.load_state_dict(torch.load(
+            path, map_location=self.device, weights_only=True
+        ))
+        self._sync_inference_policy()
 
     def save_checkpoint(self, path, episode):
         torch.save({
@@ -212,9 +236,10 @@ class ReinRateAgent:
         }, path)
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         self.policy.load_state_dict(checkpoint["policy"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self._sync_inference_policy()
         self.gradient_updates = int(checkpoint.get("gradient_updates", 0))
         self.reset_rollout()
         return int(checkpoint["episode"])

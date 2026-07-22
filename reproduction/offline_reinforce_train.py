@@ -18,11 +18,18 @@ from offline_reinforce_model import ReinRateAgent
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXECUTABLE = ROOT / "build/scratch/reproduction/ns3.36.1-two-node-ht-default"
+BUILD_PROFILE = os.environ.get("REPRODUCTION_NS3_PROFILE", "default")
+if BUILD_PROFILE not in ("default", "optimized"):
+    raise RuntimeError("REPRODUCTION_NS3_PROFILE must be default or optimized")
+BUILD_DIRECTORY = ROOT / ("build-optimized" if BUILD_PROFILE == "optimized" else "build")
+EXECUTABLE = (
+    BUILD_DIRECTORY / "scratch/reproduction"
+    / f"ns3.36.1-two-node-ht-{BUILD_PROFILE}"
+)
 RESULTS = ROOT / "my-project-results"
 PREFIX = "reproduction-scenario1-offline-window20-episodic-reinforce"
 PACKET_WINDOW = 20
-MAX_REFERENCE_MBPS = 29.6
+MAX_REFERENCE_MBPS = 33.6
 
 
 def policy_state(observation):
@@ -118,7 +125,7 @@ def run_episode(
         interface = create_interface()
     interface.PyReset()
     environment = os.environ.copy()
-    environment["LD_LIBRARY_PATH"] = str(ROOT / "build/lib")
+    environment["LD_LIBRARY_PATH"] = str(BUILD_DIRECTORY / "lib")
     process = subprocess.Popen(
         build_command(seed, simulation_time, start_distance, moving_speed, throughput_csv),
         cwd=ROOT,
