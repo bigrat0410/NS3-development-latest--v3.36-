@@ -284,7 +284,17 @@ RLRateEnv::PrepareAmpduObservation (WifiRemoteStation* station,
                      ? static_cast<double> (nSuccessfulMpdus) * m_payloadSize * 8.0 /
                            elapsedSeconds / 1e6
                      : 0.0;
-  m_rawReward = m_throughput;
+  static constexpr std::array<double, 8> dataRatesAmpduOff20Mhz = {
+      5.7, 10.6, 14.8, 18.5, 24.6, 29.4, 31.7, 33.6};
+  static constexpr std::array<double, 8> dataRatesAmpduOn20Mhz = {
+      5.9, 12.0, 18.1, 24.2, 36.4, 48.7, 54.8, 60.9};
+  const auto& dataRates20Mhz = m_ampduEnabled ? dataRatesAmpduOn20Mhz
+                                               : dataRatesAmpduOff20Mhz;
+  const std::uint8_t mcs = GetCurrentMcs ();
+  const double efficiency = m_throughput / dataRates20Mhz[mcs];
+  m_rawReward = static_cast<double> (nSuccessfulMpdus + nFailedMpdus) *
+                ((static_cast<double> (mcs) + 2.0) / 9.0) *
+                efficiency * efficiency * efficiency;
   m_observationSuccessfulMpdus = nSuccessfulMpdus;
   m_observationFailedMpdus = nFailedMpdus;
   m_observationAggregateMpdus = nSuccessfulMpdus + nFailedMpdus;
@@ -518,6 +528,15 @@ void
 RLRateEnv::DoReportFinalDataFailed (WifiRemoteStation* station)
 {
   NS_LOG_FUNCTION (this << station);
+  if (m_ampduEnabled && m_decisionPerAmpdu
+      && Simulator::Now () >= m_measurementStart)
+    {
+      // A completely failed A-MPDU may not produce DoReportAmpduTxStatus.
+      // Emit a zero-throughput observation so the agent can lower the MCS
+      // instead of becoming permanently stuck after losing the Block ACK.
+      PrepareAmpduObservation (station, 0, 1);
+      return;
+    }
   if (!m_ampduEnabled && Simulator::Now () >= m_measurementStart)
     {
       //每次失败已由DoReportDataFailed计入，最终失败回调不重复累计PHY时间。

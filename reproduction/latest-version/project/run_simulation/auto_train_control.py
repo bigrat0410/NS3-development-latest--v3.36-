@@ -20,6 +20,7 @@ hand-run reproduction-scenario1-offline-window20-episodic-reinforce-*.pt files.
 """
 
 import argparse
+import contextlib
 import csv
 import functools
 import math
@@ -55,6 +56,7 @@ HISTORY_FIELDS = [
     "exploration_count", "action_counts", "validation_throughput_mbps",
     "validation_probability", "validation_zero_fraction",
     "validation_longest_zero_run", "gamma", "epsilon", "learning_rate",
+    "segment_count", "segment_mean_throughput_mbps",
 ]
 
 
@@ -118,6 +120,8 @@ def statistics_block(recent, episode, agent):
     loss = [row["loss"] for row in recent]
     grad = [row["gradient_norm"] for row in recent]
     explore = [row["exploration_count"] for row in recent]
+    segment_counts = [row["segment_count"] for row in recent]
+    segment_throughputs = [value for row in recent for value in row["segment_throughputs"]]
     action_totals = [0] * 8
     for row in recent:
         for i, count in enumerate(row["action_counts"]):
@@ -134,6 +138,10 @@ def statistics_block(recent, episode, agent):
     print(f"  loss              均值 {sum(loss)/n:7.4f}  最新 {loss[-1]:7.4f}", flush=True)
     print(f"  gradient norm     均值 {sum(grad)/n:7.4f}  最新 {grad[-1]:7.4f}", flush=True)
     print(f"  exploration/ep    均值 {sum(explore)/n:7.1f}", flush=True)
+    if segment_throughputs:
+        print(f"  聚合包分段         总数 {sum(segment_counts)}  每轮均值 {sum(segment_counts)/n:.1f}  "
+              f"吞吐均值 {sum(segment_throughputs)/len(segment_throughputs):.3f}  "
+              f"最新 {segment_throughputs[-1]:.3f} Mbps", flush=True)
     if val:
         print(f"  validation tp     均值 {sum(val)/len(val):7.3f}  最新 {val[-1]:7.3f} Mbps", flush=True)
     dist = "  ".join(f"MCS{i}:{100*c/total_actions:4.1f}%" for i, c in enumerate(action_totals))
@@ -287,12 +295,25 @@ def main():
     parser.add_argument("--epsilon", type=float, default=0.3)
     parser.add_argument(
         "--beMaxAmpduSize", dest="be_max_ampdu_size", type=int,
-        default=T.DEFAULT_BE_MAX_AMPDU_SIZE,
+        default=65535,
         help="BE A-MPDU maximum size in bytes (0 disables aggregation)",
+    )
+    parser.add_argument(
+        "--decisionPerAmpdu", action=argparse.BooleanOptionalAction, default=True,
+        help="make one decision after each A-MPDU (enabled by default)",
+    )
+    parser.add_argument(
+        "--writeSegmentCsv", "--outputCsv", dest="write_segment_csv",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="write every A-MPDU decision segment to CSV (disabled by default)",
     )
     parser.add_argument("--resume", action="store_true", help="从上次的 -auto 检查点续训")
     args = parser.parse_args()
     mode = T.ampdu_mode(args.be_max_ampdu_size)
+    if args.be_max_ampdu_size != 65535:
+        parser.error("latest-version training requires --beMaxAmpduSize=65535")
+    if not args.decisionPerAmpdu:
+        parser.error("latest-version training requires --decisionPerAmpdu")
     state_encoder = functools.partial(
         rbf_policy_state,
         max_reference_mbps=T.max_reference_mbps(args.be_max_ampdu_size),
@@ -310,13 +331,14 @@ def main():
         epsilon=args.epsilon,
         entropy_coef=ENTROPY_COEF,
     )
-    run_prefix = f"{AUTO_PREFIX}-{mode}"
-    run_label_base = f"{AUTO_LABEL_BASE}-{mode}"
+    run_prefix = f"{AUTO_PREFIX}-{mode}-per-ampdu"
+    run_label_base = f"{AUTO_LABEL_BASE}-{mode}-per-ampdu"
     checkpoint = T.RESULTS / f"{run_prefix}-checkpoint.pt"
     best_policy = T.RESULTS / f"{run_prefix}-best.pt"
     final_policy = T.RESULTS / f"{run_prefix}-final.pt"
     history_csv = T.RESULTS / f"{run_prefix}-training.csv"
     history_svg = T.RESULTS / f"{run_prefix}-training-statistics.svg"
+    segment_csv = T.RESULTS / f"{run_prefix}-segments.csv"
 
     start_episode = 1
     best_throughput = -math.inf
@@ -344,11 +366,26 @@ def main():
     interface = T.create_interface()
     recent = []  # episodes accumulated since the last statistics block
     stopped_early = False
+    save_models = False
     try:
-        with history_csv.open("a" if append else "w", newline="") as handle:
+        segment_context = (
+            segment_csv.open("a" if append else "w", newline="")
+            if args.write_segment_csv else contextlib.nullcontext(None)
+        )
+        with history_csv.open("a" if append else "w", newline="") as handle, \
+             segment_context as segment_handle:
             writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+            segment_writer = (
+                csv.DictWriter(
+                    segment_handle,
+                    fieldnames=["episode", "segment", "simulation_time_s", "mcs", "packet_count",
+                                "successful_packets", "failed_packets", "throughput_mbps", "reward"],
+                ) if segment_handle else None
+            )
             if not append:
                 writer.writeheader()
+                if segment_writer:
+                    segment_writer.writeheader()
 
             episode = start_episode
             while episode <= target:
@@ -361,6 +398,9 @@ def main():
                     training=True, interface=interface, log_decisions=keep_trace,
                     state_encoder=state_encoder,
                     be_max_ampdu_size=args.be_max_ampdu_size,
+                    decision_per_ampdu=True,
+                    collect_segments=True,
+                    print_every=10 ** 9,
                 )
                 if train["updates"] != 1:
                     raise RuntimeError(f"episode {episode} made {train['updates']} updates, expected 1")
@@ -378,7 +418,6 @@ def main():
                     )
                     if validation["throughput"] > best_throughput:
                         best_throughput = validation["throughput"]
-                        agent.save_policy(best_policy)
 
                 writer.writerow({
                     "episode": episode,
@@ -407,9 +446,18 @@ def main():
                     "gamma": agent.gamma,
                     "epsilon": agent.epsilon,
                     "learning_rate": args.learning_rate,
+                    "segment_count": len(train["segments"]),
+                    "segment_mean_throughput_mbps": (
+                        sum(row["throughput_mbps"] for row in train["segments"])
+                        / len(train["segments"]) if train["segments"] else 0.0
+                    ),
                 })
+                if segment_writer:
+                    for segment in train["segments"]:
+                        segment_writer.writerow({"episode": episode, **segment})
                 handle.flush()
-                agent.save_checkpoint(checkpoint, episode)
+                if segment_handle:
+                    segment_handle.flush()
 
                 recent.append({
                     "episode": episode,
@@ -420,6 +468,8 @@ def main():
                     "exploration_count": train["exploration_count"],
                     "action_counts": train["action_counts"],
                     "validation": validation["throughput"] if validation else None,
+                    "segment_count": len(train["segments"]),
+                    "segment_throughputs": [row["throughput_mbps"] for row in train["segments"]],
                 })
 
                 if episode % args.progress_every == 0:
@@ -427,6 +477,7 @@ def main():
                 stats_due = episode % args.stats_every == 0
                 if stats_due:
                     statistics_block(recent, episode, agent)
+                    _plot_history_safe(history_csv, history_svg)
                     recent = []
 
                 # At the end of a chunk, show stats (if not just shown) and ask.
@@ -434,29 +485,29 @@ def main():
                     if not stats_due:
                         statistics_block(recent, episode, agent)
                         recent = []
-                    agent.save_policy(final_policy)
                     _plot_history_safe(history_csv, history_svg)
                     if ask_yes_no(f"已训练到 episode {episode}。是否继续训练？", default=True):
                         more = ask_int("再训练多少个 episode", default=args.continue_default)
                         target += more
                     else:
+                        save_models = ask_yes_no("是否保存 checkpoint、best 和 final 模型？", default=True)
                         stopped_early = True
                         break
                 episode += 1
 
-        agent.save_policy(final_policy)
-        if not best_policy.exists():
-            agent.save_policy(best_policy)
         _plot_history_safe(history_csv, history_svg)
 
-        print(f"\n[完成] 训练结束（{'手动停止' if stopped_early else '达到目标'}），"
-              f"最终模型: {final_policy}", flush=True)
+        if save_models:
+            agent.save_checkpoint(checkpoint, episode)
+            agent.save_policy(best_policy)
+            agent.save_policy(final_policy)
+            print(f"\n[完成] 模型已保存: {final_policy}", flush=True)
+        else:
+            print(f"\n[完成] 训练结束（{'手动停止' if stopped_early else '达到目标'}），未保存模型。", flush=True)
         print(f"        训练历史: {history_csv}", flush=True)
+        if args.write_segment_csv:
+            print(f"        分段记录: {segment_csv}", flush=True)
         print(f"        训练统计图: {history_svg}", flush=True)
-
-        # Reuse the SAME interface for the test -- a second one in this
-        # process would fail with a boost interprocess library_error.
-        run_test(final_policy, args, interface)
     finally:
         del interface
 

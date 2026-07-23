@@ -29,3 +29,14 @@ ns3ai_env/bin/python -B scratch/reproduction/latest-version/project/calibrate_mc
 ns3ai_env/bin/python -B scratch/reproduction/latest-version/project/calibrate_mcs_references.py --beMaxAmpduSize=0
 scratch/reproduction/latest-version/project/run_simulation/run_offline_auto.sh --beMaxAmpduSize=65535
 ```
+
+交互式启动时会先询问使用`default`还是`optimized`构建。也可以通过参数直接指定，适合非交互运行：
+
+```bash
+scratch/reproduction/latest-version/project/run_simulation/run_offline_auto.sh --ns3Profile optimized --beMaxAmpduSize=65535
+```
+
+也仍可设置环境变量`REPRODUCTION_NS3_PROFILE=default|optimized`；命令行参数优先。
+
+详细的逐 A-MPDU 分段 CSV 默认关闭。如需输出，启动训练时增加
+`--writeSegmentCsv`（也可使用`--outputCsv`）。
