@@ -67,6 +67,7 @@
 
 #include "rl-env.h"
 
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -118,6 +119,11 @@ main (int argc, char *argv[])
   double simulationTime = 80.0;
   double startDistance = 1.0;
   double movingSpeed = 0.5;
+  uint32_t scenario = 1;
+  double randomWalkMinDistance = 0.0;
+  double randomWalkMaxDistance = 24.0;
+  double randomWalkSpeed = 3.0;
+  double randomWalkDirectionInterval = 2.0;
 
   //论文场景使用持续的 60 Mbps UDP 下行业务
   double trafficStartTime = 0.5;
@@ -148,6 +154,11 @@ main (int argc, char *argv[])
   cmd.AddValue ("simulationTime", "Simulation time in seconds", simulationTime);
   cmd.AddValue ("startDistance", "Initial distance between the two nodes in meters", startDistance);
   cmd.AddValue ("movingSpeed", "Speed of node 1 moving away from node 0 in m/s", movingSpeed);
+  cmd.AddValue ("scenario", "Mobility scenario: 1=linear outward, 2=1D random walk", scenario);
+  cmd.AddValue ("randomWalkMinDistance", "Scenario 2 minimum STA distance in meters", randomWalkMinDistance);
+  cmd.AddValue ("randomWalkMaxDistance", "Scenario 2 maximum STA distance in meters", randomWalkMaxDistance);
+  cmd.AddValue ("randomWalkSpeed", "Scenario 2 constant STA speed in m/s", randomWalkSpeed);
+  cmd.AddValue ("randomWalkDirectionInterval", "Scenario 2 random direction decision interval in seconds", randomWalkDirectionInterval);
   cmd.AddValue ("trafficStartTime", "UDP traffic start time in seconds", trafficStartTime);
   cmd.AddValue ("dataRate", "Offered UDP load", offeredDataRate);
   cmd.AddValue ("sampleInterval", "Throughput sampling interval in seconds", sampleInterval);
@@ -183,6 +194,21 @@ main (int argc, char *argv[])
                 << "pathLossExponent must be positive" << std::endl;
       return 1;
     }
+  if (scenario != 1 && scenario != 2)
+    {
+      std::cerr << "Invalid scenario: use 1 or 2" << std::endl;
+      return 1;
+    }
+  if (scenario == 2 &&
+      (randomWalkMinDistance < 0.0 ||
+       randomWalkMaxDistance <= randomWalkMinDistance ||
+       startDistance < randomWalkMinDistance ||
+       startDistance > randomWalkMaxDistance ||
+       randomWalkSpeed <= 0.0 || randomWalkDirectionInterval <= 0.0))
+    {
+      std::cerr << "Invalid Scenario 2 mobility parameters" << std::endl;
+      return 1;
+    }
   //创建两个节点：node 0 是 AP，node 1 是移动 STA
   NodeContainer wifiNodes;
   wifiNodes.Create (2);
@@ -194,21 +220,45 @@ main (int argc, char *argv[])
   positionAlloc->Add (Vector (startDistance, 0.0, 0.0));
   mobility.SetPositionAllocator (positionAlloc);
 
-  //设置静态位置模型，安装到node0、node1
+  // AP stays fixed in both scenarios.
   mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
   mobility.Install (wifiNodes.Get (0));
-  mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
-  mobility.Install (wifiNodes.Get (1));
-
-  //取出node1的静态模型，调用里面的setv，设置移动开始时间、速度
-  Ptr<ConstantVelocityMobilityModel> movingNode =
-      wifiNodes.Get (1)->GetObject<ConstantVelocityMobilityModel> ();
-  double mobilityStartTime = 0.0;
-  Simulator::Schedule(
-      Seconds(mobilityStartTime),
-      &ConstantVelocityMobilityModel::SetVelocity,
-      movingNode,
-      Vector(movingSpeed, 0.0, 0.0));
+  if (scenario == 1)
+    {
+      mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
+      mobility.Install (wifiNodes.Get (1));
+      Ptr<ConstantVelocityMobilityModel> movingNode =
+          wifiNodes.Get (1)->GetObject<ConstantVelocityMobilityModel> ();
+      Simulator::ScheduleNow (&ConstantVelocityMobilityModel::SetVelocity,
+                              movingNode,
+                              Vector (movingSpeed, 0.0, 0.0));
+    }
+  else
+    {
+      // RandomWalk2d normally samples any angle in [0, 2*pi).  Scenario 2 is
+      // strictly one-dimensional, so sample only +x (0) or -x (pi).  A new
+      // draw is made every two seconds and may equal the previous draw; a
+      // direction decision therefore does not imply a mandatory reversal.
+      Ptr<EmpiricalRandomVariable> direction = CreateObject<EmpiricalRandomVariable> ();
+      direction->CDF (0.0, 0.5);
+      direction->CDF (std::acos (-1.0), 1.0);
+      constexpr double oneDimensionalTolerance = 1e-7;
+      mobility.SetMobilityModel (
+          "ns3::RandomWalk2dMobilityModel",
+          "Bounds", RectangleValue (Rectangle (randomWalkMinDistance,
+                                                randomWalkMaxDistance,
+                                                -oneDimensionalTolerance,
+                                                oneDimensionalTolerance)),
+          "Mode", StringValue ("Time"),
+          "Time", TimeValue (Seconds (randomWalkDirectionInterval)),
+          "Speed", StringValue ("ns3::ConstantRandomVariable[Constant=" +
+                                std::to_string (randomWalkSpeed) + "]"),
+          "Direction", PointerValue (direction));
+      mobility.Install (wifiNodes.Get (1));
+      NodeContainer movingSta;
+      movingSta.Add (wifiNodes.Get (1));
+      mobility.AssignStreams (movingSta, 0);
+    }
 
   //创建信道配置器，并根据命令行参数选择随距离变化或固定的传播损耗
   YansWifiChannelHelper wifiChannel;
@@ -367,7 +417,16 @@ main (int argc, char *argv[])
             << std::endl;
   std::cout << "Node 1 starts at " << wifiNodes.Get (1)->GetObject<MobilityModel> ()->GetPosition ()
             << std::endl;
-  std::cout << "Node 1 velocity: " << movingNode->GetVelocity () << std::endl;
+  std::cout << "Mobility scenario: " << scenario << std::endl;
+  std::cout << "Node 1 velocity: "
+            << wifiNodes.Get (1)->GetObject<MobilityModel> ()->GetVelocity () << std::endl;
+  if (scenario == 2)
+    {
+      std::cout << "Scenario 2 RandomWalk2d: x=[" << randomWalkMinDistance << ','
+                << randomWalkMaxDistance << "] m, speed=" << randomWalkSpeed
+                << " m/s, direction decision every " << randomWalkDirectionInterval
+                << " s, direction in {+x,-x}" << std::endl;
+    }
   std::cout << "rateManagerType " << rateManagerType << std::endl;
   std::cout << "Distance-throughput CSV: " << outputFile << std::endl;
   // 设置仿真停止时间

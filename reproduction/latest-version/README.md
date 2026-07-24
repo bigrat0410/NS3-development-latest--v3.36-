@@ -1,3 +1,23 @@
+##
+
+场景2训练命令：
+
+  scratch/reproduction/latest-version/project/run_simulation/
+  run_offline_auto.sh \
+    --scenario 2 \
+    --beMaxAmpduSize=65535
+
+  启动后仍可选择 default 或 optimized。场景1继续使用：
+
+  scratch/reproduction/latest-version/project/run_simulation/
+  run_offline_auto.sh \
+    --scenario 1 \
+    --beMaxAmpduSize=65535
+
+
+
+
+
 # 最新可复现版本
 
 这是离线Window-20 REINFORCE工作流的精选可运行快照，将训练流程、ns-3集成与SVG生成模块相互解耦。
@@ -37,6 +57,30 @@ scratch/reproduction/latest-version/project/run_simulation/run_offline_auto.sh -
 ```
 
 也仍可设置环境变量`REPRODUCTION_NS3_PROFILE=default|optimized`；命令行参数优先。
+
+## 场景2：一维 Random Walk
+
+训练控制器现在支持`--scenario 2`。场景2保持场景1的Wi-Fi、信道、业务、
+A-MPDU、奖励和模型参数不变，仅替换移动模型和episode时长：
+
+- AP固定在0 m，STA初始距离1 m；
+- STA使用`ns3::RandomWalk2dMobilityModel`，严格沿x轴在0–24 m内移动；
+- 速度恒定3.0 m/s；
+- `Mode=Time`，每2 s独立随机选择`+x`或`-x`，因此可能保持原方向；
+- 到0 m或24 m边界时按RandomWalk2d规则反弹；
+- 每个episode为40 s。
+
+从仓库根目录启动场景2训练：
+
+```bash
+scratch/reproduction/latest-version/project/run_simulation/run_offline_auto.sh \
+  --scenario 2 --beMaxAmpduSize=65535
+```
+
+场景1仍是默认值，行为与已有实验一致。场景2的模型和训练历史使用
+`reproduction-scenario2-...`前缀，不会覆盖场景1文件。可选参数
+`--randomWalkMinDistance`、`--randomWalkMaxDistance`和
+`--randomWalkDirectionInterval`用于受控实验；上述命令使用论文场景默认值。
 
 详细的逐 A-MPDU 分段 CSV 默认关闭。如需输出，启动训练时增加
 `--writeSegmentCsv`（也可使用`--outputCsv`）。

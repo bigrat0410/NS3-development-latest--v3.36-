@@ -75,6 +75,15 @@ file(
   LIST_DIRECTORIES true
   ${CMAKE_CURRENT_SOURCE_DIR}/**
 )
+# A scratch experiment may itself be version-controlled.  Never interpret
+# nested Git implementation directories as ns-3 scratch programs.
+list(FILTER scratch_subdirectories EXCLUDE REGEX "/\\.git(/|$)")
+# success_reproduct contains immutable source snapshots for documentation and
+# reproduction, not additional build targets.
+list(FILTER scratch_subdirectories EXCLUDE REGEX "/success_reproduct(/|$)")
+# latest-version also carries a self-contained source snapshot; the live target
+# remains scratch/reproduction.
+list(FILTER scratch_subdirectories EXCLUDE REGEX "/reproduction/latest-version(/|$)")
 # Filter out files
 foreach(entry ${scratch_subdirectories})
   if(NOT (IS_DIRECTORY ${entry}))
